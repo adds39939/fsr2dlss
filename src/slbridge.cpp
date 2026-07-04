@@ -26,7 +26,8 @@
 #include "slbridge.h"
 
 extern "C" void bridge_logs(const char* s);
-extern "C" bool nvhook_block_flipmetering();  // nvhook.cpp — disable Blackwell HW flip metering
+extern "C" bool nvhook_install();             // nvhook.cpp — hook nvapi_QueryInterface (markers + flip block)
+extern "C" void nvhook_set_flip_block(bool);  // block SetFlipConfig (software pacing) or not
 static void L(const char* fmt, ...)
 {
     char buf[1400];
@@ -307,8 +308,9 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
     // (HW flip metering drops it with our late-hook cadence). Independent Flip is unaffected.
     // FlipMetering=hardware skips the block to try HW metering (experimental; currently doesn't
     // insert frames under injection on Blackwell — see docs). See nvhook.cpp.
-    if (g_cfg.flipMode != 1) nvhook_block_flipmetering();
-    else L("[SL] FlipMetering=hardware -> NOT blocking SetFlipConfig (experimental under injection)");
+    nvhook_set_flip_block(g_cfg.flipMode != 1);   // software/auto -> block; hardware -> don't
+    nvhook_install();                             // always hook nvapi (needed for Steam marker work too)
+    if (g_cfg.flipMode == 1) L("[SL] FlipMetering=hardware -> NOT blocking SetFlipConfig (experimental under injection)");
 
     wchar_t interp[MAX_PATH];
     _snwprintf(interp, MAX_PATH, L"%s\\sl.interposer.dll", slDir);
