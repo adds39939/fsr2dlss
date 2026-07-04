@@ -1,0 +1,31 @@
+; fsr2dlss configuration — rename to fsr2dlss.ini and place next to amd_fidelityfx_dx12.dll
+; (the game's Win64 folder). Lines starting with ; or # are comments. Read once at startup.
+
+[FrameGen]
+; Frame-generation multiplier: 2 = 2x (1 generated frame), 3 = 3x, 4 = 4x.
+; 3x/4x (Multi-Frame Generation) require an RTX 50-series card and a Streamline/nvngx that
+; reports MFG support. Automatically clamped down to the card's reported maximum.
+Multiplier = 2
+
+; Flip metering mode:
+;   software  = block NvAPI_D3D12_SetFlipConfig -> DLSS-G software pacer (default; works under injection)
+;   hardware  = don't block -> try Blackwell hardware flip metering (experimental; currently does NOT
+;               insert generated frames under injection, so FG will appear off)
+;   auto      = same as software for now
+FlipMetering = software
+
+[Upscaling]
+; DLSS super-resolution replacing the game's FSR upscaler.
+; true  = DLSS (quality mode auto-picked from the in-game FSR preset / render resolution)
+; false = pass the upscale through to the game's FSR
+DLSS = true
+
+[HUD]
+; Experimental: tag HUDLessColor + an (empty) UI layer for DLSS-G. Games that bake the UI into
+; the frame (e.g. Lies of P) may see no benefit; leave off unless experimenting.
+HudlessTags = false
+
+[Streamline]
+; Host SDK version reported to slInit. MUST match the sl.*.dll set in the streamline\ folder.
+; 2.7.1 is the tested working version (software pacer + correct colors on Blackwell).
+HostVersion = 2.7.1

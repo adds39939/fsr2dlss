@@ -16,6 +16,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 
 #include "sl.h"
 #include "sl_consts.h"
@@ -35,6 +36,78 @@ static void L(const char* fmt, ...)
     if (n < 0) return;
     buf[n] = '\n'; buf[n + 1] = 0;
     bridge_logs(buf);
+}
+
+// ---- mod directory + fsr2dlss.ini config ------------------------------------
+// All runtime files (fsr2dlss.ini, toggles) live next to this DLL, resolved from the DLL path
+// so there are no hardcoded absolute paths.
+static wchar_t g_modDir[MAX_PATH] = L"";
+static void computeModDir()
+{
+    if (g_modDir[0]) return;
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&computeModDir, &self);
+    wchar_t path[MAX_PATH] = L"";
+    if (self) GetModuleFileNameW(self, path, MAX_PATH);
+    wcsncpy(g_modDir, path, MAX_PATH - 1);
+    wchar_t* slash = wcsrchr(g_modDir, L'\\');
+    if (slash) slash[1] = 0; else g_modDir[0] = 0;
+}
+// Not reentrant — use the returned pointer immediately.
+static const wchar_t* modPath(const wchar_t* name)
+{
+    static wchar_t buf[MAX_PATH];
+    computeModDir();
+    _snwprintf(buf, MAX_PATH, L"%s%s", g_modDir, name);
+    return buf;
+}
+
+struct Config {
+    int  fgMultiplier = 2;      // 2/3/4 -> numFramesToGenerate = mult-1 (clamped to card max)
+    int  flipMode     = 0;      // 0=software (block SetFlipConfig) | 1=hardware | 2=auto
+    bool dlssSR       = true;   // false -> pass upscale through to FSR
+    bool hudlessTags  = false;  // best-effort HUDLessColor/UI tags (game bakes UI, so experimental)
+    char hostVer[16]  = "2.7.1";// SL host SDK version reported to slInit
+    bool loaded       = false;
+};
+static Config g_cfg;
+
+static char* trimStr(char* s)
+{
+    while (*s==' '||*s=='\t'||*s=='\r'||*s=='\n') ++s;
+    char* e = s + strlen(s);
+    while (e > s && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) *--e = 0;
+    return s;
+}
+static bool cfgBool(const char* v) { return !_stricmp(v,"true")||!strcmp(v,"1")||!_stricmp(v,"on")||!_stricmp(v,"yes"); }
+
+static void loadConfig()
+{
+    if (g_cfg.loaded) return;
+    g_cfg.loaded = true;
+    // Legacy: sl_hostver.txt still honored if present (INI overrides it).
+    { FILE* vf = _wfopen(modPath(L"sl_hostver.txt"), L"rb");
+      if (vf) { char b[16]={0}; fread(b,1,sizeof(b)-1,vf); fclose(vf); char* t=trimStr(b); if (*t) { strncpy(g_cfg.hostVer,t,sizeof(g_cfg.hostVer)-1); g_cfg.hostVer[sizeof(g_cfg.hostVer)-1]=0; } } }
+    FILE* f = _wfopen(modPath(L"fsr2dlss.ini"), L"rb");
+    if (!f) { L("[CFG] no fsr2dlss.ini next to the mod; using defaults (host=%s)", g_cfg.hostVer); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* c = strpbrk(line, ";#"); if (c) *c = 0;
+        char* eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0;
+        char* key = trimStr(line);
+        char* val = trimStr(eq + 1);
+        for (char* p = key; *p; ++p) *p = (char)tolower((unsigned char)*p);
+        if      (!strcmp(key,"multiplier"))   { int m=atoi(val); if (m>=2 && m<=4) g_cfg.fgMultiplier=m; }
+        else if (!strcmp(key,"flipmetering"))   g_cfg.flipMode = !_stricmp(val,"hardware")?1 : (!_stricmp(val,"auto")?2:0);
+        else if (!strcmp(key,"dlss"))           g_cfg.dlssSR = cfgBool(val);
+        else if (!strcmp(key,"hudlesstags"))    g_cfg.hudlessTags = cfgBool(val);
+        else if (!strcmp(key,"hostversion"))  { strncpy(g_cfg.hostVer,val,sizeof(g_cfg.hostVer)-1); g_cfg.hostVer[sizeof(g_cfg.hostVer)-1]=0; }
+    }
+    fclose(f);
+    L("[CFG] fsr2dlss.ini: multiplier=%dx flipMetering=%d dlssSR=%d hudlessTags=%d host=%s",
+      g_cfg.fgMultiplier, g_cfg.flipMode, (int)g_cfg.dlssSR, (int)g_cfg.hudlessTags, g_cfg.hostVer);
 }
 
 // ---- minimal FfxApi types we parse (layouts verified from runtime) ----------
@@ -73,7 +146,6 @@ static PFun_slDLSSSetOptions*         p_slDLSSSetOptions  = nullptr;
 static uint32_t g_srFrameIdx  = 0x40000000; // SR frame-token space, separate from DLSS-G's
 static uint32_t g_srLastOutW  = 0, g_srLastOutH = 0; static int g_srLastMode = -1;
 static bool     g_srDisabled  = false;
-static const wchar_t* kSrOffFlag = L"E:\\Games\\Steam\\steamapps\\common\\Lies of P\\LiesofP\\Binaries\\Win64\\dlss_sr_off.flag";
 
 // 2.11+: per-frame latency markers live in sl.pcl (slReflexSetMarker is gone).
 static const sl::Feature kFeaturePCL = 4;
@@ -117,16 +189,12 @@ static uint32_t g_curFrameID     = 0xFFFFFFFF; // game's frameID for the current
 static unsigned g_presentCount   = 0;         // presents seen (warmup gate for the Reflex sleep)
 static const unsigned WARMUP_PRESENTS = 120;  // skip the throttling sleep during fragile SL/swapchain init
 static bool     g_lastAppliedInterp = false;  // last interp-only flag applied
-// Dev toggle (no rebuild): create this file to force eShowOnlyInterpolatedFrame.
-static const wchar_t* kInterpFlag = L"E:\\Games\\Steam\\steamapps\\common\\Lies of P\\LiesofP\\Binaries\\Win64\\fg_interp.flag";
-// Dev toggle (no rebuild): file containing a target FPS integer -> Reflex frame cap.
-// Hardware flip metering (SL 2.11) needs a present cadence to slot the generated frame
-// into; uncapped vsync-off gives none, so it drops the generated frame every present.
-static const wchar_t* kFpsCapFile = L"E:\\Games\\Steam\\steamapps\\common\\Lies of P\\LiesofP\\Binaries\\Win64\\fg_fpscap.txt";
+// Dev toggles (no rebuild), all resolved next to the mod DLL: fg_interp.flag (show only generated
+// frames), fg_fpscap.txt (target FPS -> Reflex frame cap).
 static uint32_t g_frameLimitUs = 0;           // Reflex frame cap in microseconds (0 = uncapped)
 static uint32_t readFpsCapUs()
 {
-    FILE* f = _wfopen(kFpsCapFile, L"rb");
+    FILE* f = _wfopen(modPath(L"fg_fpscap.txt"), L"rb");
     if (!f) return 0;
     char buf[32] = {0};
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -231,12 +299,16 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
 {
     if (g_slReady) return true;
     g_device = (ID3D12Device*)deviceV;
+    loadConfig();
     L("[SL] init begin dir=%ls device=%p", slDir, deviceV);
 
-    // Disable Blackwell HW flip metering BEFORE slInit so SL DLSS-G uses the software pacer,
-    // which actually presents the interpolated frame (HW flip metering drops it with our
-    // late-hook cadence). Independent Flip is unaffected. See nvhook.cpp.
-    nvhook_block_flipmetering();
+    // Flip metering: by default (software / auto) block Blackwell HW flip metering BEFORE slInit so
+    // DLSS-G uses the software pacer, which actually presents the interpolated frame under injection
+    // (HW flip metering drops it with our late-hook cadence). Independent Flip is unaffected.
+    // FlipMetering=hardware skips the block to try HW metering (experimental; currently doesn't
+    // insert frames under injection on Blackwell — see docs). See nvhook.cpp.
+    if (g_cfg.flipMode != 1) nvhook_block_flipmetering();
+    else L("[SL] FlipMetering=hardware -> NOT blocking SetFlipConfig (experimental under injection)");
 
     wchar_t interp[MAX_PATH];
     _snwprintf(interp, MAX_PATH, L"%s\\sl.interposer.dll", slDir);
@@ -266,13 +338,12 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
     pref.pathToLogsAndData = slDir;
     pref.featuresToLoad    = feats;
     pref.numFeaturesToLoad = 4;
-    // Host SDK version to report + whether to use frame-based tagging, read from sl_hostver.txt
+    // Host SDK version to report + whether to use frame-based tagging, from fsr2dlss.ini (g_cfg.hostVer)
     // ("major.minor.patch", default 2.7.1) so we can swap Streamline plugin sets WITHOUT rebuilding.
     // slSetTagForFrame + eUseFrameBasedResourceTagging + v5 DLSSGOptions exist only from 2.7.30+;
     // older plugins (2.2-2.7.2x) use the global slSetTag software-pacer path that GENERATED on 2.2.
     uint32_t vMaj = 2, vMin = 7, vPat = 1;
-    { FILE* vf = _wfopen(L"E:\\Games\\Steam\\steamapps\\common\\Lies of P\\LiesofP\\Binaries\\Win64\\sl_hostver.txt", L"rb");
-      if (vf) { char b[32] = {0}; fread(b, 1, sizeof(b) - 1, vf); fclose(vf); sscanf(b, "%u.%u.%u", &vMaj, &vMin, &vPat); } }
+    sscanf(g_cfg.hostVer, "%u.%u.%u", &vMaj, &vMin, &vPat);
     g_slFrameTag = (vMaj > 2) || (vMaj == 2 && (vMin > 7 || (vMin == 7 && vPat >= 30)));
     const uint64_t hostVer = ((uint64_t)vMaj << 48) | ((uint64_t)vMin << 32) | ((uint64_t)vPat << 16) | 0xfedcULL;
 
@@ -552,13 +623,33 @@ struct DLSSGOptions5 {
 };
 #pragma pack(pop)
 
+// Hand-laid DLSSGState v2 so we can read numFramesToGenerateMax (the card's MFG cap).
+// GUID cc8ac8e1-a179-44f5-97fa-e74112f9bc61.
+#pragma pack(push, 8)
+struct DLSSGState2 {
+    void*    next = nullptr;
+    uint32_t g0 = 0xcc8ac8e1; uint16_t g1 = 0xa179, g2 = 0x44f5; uint8_t g3[8] = {0x97,0xfa,0xe7,0x41,0x12,0xf9,0xbc,0x61};
+    uint64_t structVersion = 2;
+    uint64_t estimatedVRAMUsageInBytes = 0;
+    uint32_t status = 0;
+    uint32_t minWidthOrHeight = 0;
+    uint32_t numFramesActuallyPresented = 0;
+    uint32_t numFramesToGenerateMax = 0;
+};
+#pragma pack(pop)
+
+static uint32_t g_dlssgMaxGen = 1;   // numFramesToGenerateMax reported by the card (1 = 2x only)
 static sl::Result setDlssgOptions(uint32_t mode, bool interpOnly)
 {
     if (!p_slDLSSGSetOptions) return sl::Result::eErrorNotInitialized;
     DLSSGOptions5 o;
     o.structVersion = g_slFrameTag ? 5 : 1;   // older plugins (<2.7.30) only understand v1
     o.mode = mode;
-    o.numFramesToGenerate = 1;
+    // Multi-frame gen: multiplier N -> N-1 generated frames. Clamp to the card's reported max
+    // (populated from DLSSGState in feedDLSSG); defaults to 1 (2x) which is safe on any card.
+    uint32_t want = (uint32_t)(g_cfg.fgMultiplier > 1 ? g_cfg.fgMultiplier - 1 : 1);
+    if (g_dlssgMaxGen >= 1 && want > g_dlssgMaxGen) want = g_dlssgMaxGen;
+    o.numFramesToGenerate = want;
     o.flags = interpOnly ? 1u : 0u;
     o.queueParallelismMode = 0;   // eBlockPresentingClientQueue (v3+, ignored at v1)
     sl::ViewportHandle vp{0};
@@ -803,7 +894,7 @@ static void feedDLSSG(const void* d)
     // screen then shows a moving image, generation reaches the display; if it is
     // black/frozen, generated frames are produced but never presented.
     if ((g_frameCount % 120) == 1) {
-        g_diagShowInterpOnly = (GetFileAttributesW(kInterpFlag) != INVALID_FILE_ATTRIBUTES);
+        g_diagShowInterpOnly = (GetFileAttributesW(modPath(L"fg_interp.flag")) != INVALID_FILE_ATTRIBUTES);
         uint32_t newCap = readFpsCapUs();
         if (newCap != g_frameLimitUs) { g_frameLimitUs = newCap; L("[FGC] frameLimitUs=%u (%u fps cap)", g_frameLimitUs, g_frameLimitUs ? 1000000/g_frameLimitUs : 0); }
     }
@@ -816,13 +907,14 @@ static void feedDLSSG(const void* d)
     // Query state EVERY frame (so numFramesActuallyPresented is per-frame, not a
     // 240-frame-stale sample) and track the max/any doubling ever observed.
     if (p_slDLSSGGetState) {
-        sl::DLSSGState st{};
-        p_slDLSSGGetState(vp, st, nullptr);
+        DLSSGState2 st{};
+        p_slDLSSGGetState(vp, *(sl::DLSSGState*)&st, nullptr);
+        if (st.numFramesToGenerateMax >= 1 && st.numFramesToGenerateMax <= 8) g_dlssgMaxGen = st.numFramesToGenerateMax;
         if (st.numFramesActuallyPresented > g_maxPresented) g_maxPresented = st.numFramesActuallyPresented;
         if (st.numFramesActuallyPresented >= 2) ++g_doubledFrames;
         if (g_frameCount <= 3 || (g_frameCount % 240) == 5) {
-            L("[FGC] f=%u feedTid=%lu fgEn=%d mode=%u status=0x%x presented=%u maxPres=%u dblFrames=%u vram=%lluMB minWH=%u render=%ux%u zNear=%.1f hudTagged=%d interpOnly=%d | wrapperLive=%d presentTid=%lu presentMarks=%ld",
-              g_frameCount, g_feedTid, (int)g_fgEnabled, g_dlssgMode, (unsigned)st.status, st.numFramesActuallyPresented,
+            L("[FGC] f=%u feedTid=%lu fgEn=%d mode=%u mult=%dx maxGen=%u status=0x%x presented=%u maxPres=%u dblFrames=%u vram=%lluMB minWH=%u render=%ux%u zNear=%.1f hudTagged=%d interpOnly=%d | wrapperLive=%d presentTid=%lu presentMarks=%ld",
+              g_frameCount, g_feedTid, (int)g_fgEnabled, g_dlssgMode, g_cfg.fgMultiplier, g_dlssgMaxGen, (unsigned)st.status, st.numFramesActuallyPresented,
               g_maxPresented, g_doubledFrames, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20), st.minWidthOrHeight, renderW, renderH,
               zNear, (int)(g_lastHudTagged), (int)g_diagShowInterpOnly,
               (int)g_wrapperLive, g_presentTid, (long)g_presentMarks);
@@ -839,7 +931,7 @@ extern "C" bool slbridge_upscale(const void* d)
 {
     if (!g_slReady || !p_slGetNewFrameToken || !p_slSetConstants || !d) return false;
     static unsigned scan = 0;
-    if ((scan++ % 120) == 0) g_srDisabled = (GetFileAttributesW(kSrOffFlag) != INVALID_FILE_ATTRIBUTES);
+    if ((scan++ % 120) == 0) g_srDisabled = !g_cfg.dlssSR || (GetFileAttributesW(modPath(L"dlss_sr_off.flag")) != INVALID_FILE_ATTRIBUTES);
     if (g_srDisabled) return false;
 
     void*    cmdList = rdPtr(d, 0x10);
@@ -991,10 +1083,12 @@ extern "C" uint32_t slbridge_dispatch(void* handle, const void* descV)
               tf, lumMin, lumMax, (int)cs, (unsigned long)hr);
             g_csSet = true;
         }
-        // (b) DLSS-G *requires* a HUDLessColor tag. The game gives no separate hudless
-        // (UI is baked into the backbuffer), but it hands us the full rendered frame as
-        // presentColor here -> tag that, same frame token + game-provided state.
-        if (g_curToken && p_slSetTagForFrame) {
+        // (b) Optional HUDLessColor + UIColorAndAlpha tags (fsr2dlss.ini HudlessTags=true).
+        // This game BAKES UI into presentColor (no separate hudless), so this is best-effort:
+        // it tags presentColor as HUDLessColor + an empty UI layer. May not reduce UI ghosting
+        // for baked-UI titles; left off by default. Works on both the 2.7.x (slSetTag) and
+        // 2.7.30+ (slSetTagForFrame) paths.
+        if (g_cfg.hudlessTags && g_curToken) {
             void*    pcRes = rdPtr(descV, 0x18);
             uint32_t pcFmt = rdU32(descV, 0x24), pcW = rdU32(descV, 0x28), pcH = rdU32(descV, 0x2C), pcState = rdU32(descV, 0x40);
             void*    cmdList = rdPtr(descV, 0x10);
@@ -1012,7 +1106,8 @@ extern "C" uint32_t slbridge_dispatch(void* handle, const void* descV)
                     tags[nt++] = sl::ResourceTag(&ui, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &uiExt);
                 }
                 sl::ViewportHandle vp{0};
-                sl::Result tr = p_slSetTagForFrame(*g_curToken, vp, tags, nt, (void*)cmdList);
+                sl::Result tr = p_slSetTagForFrame ? p_slSetTagForFrame(*g_curToken, vp, tags, nt, (void*)cmdList)
+                                                   : p_slSetTag(vp, tags, nt, (sl::CommandBuffer*)cmdList);
                 g_lastHudTagged = (tr == sl::Result::eOk);
             }
         }

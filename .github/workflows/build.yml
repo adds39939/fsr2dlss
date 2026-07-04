@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'src/**', 'third_party/**', '.github/workflows/build.yml' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MinGW-w64 (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+
+      - name: Fetch MinHook (MIT)
+        run: git clone --depth 1 https://github.com/TsudaKageyu/minhook.git minhook_src
+
+      - name: Compile MinHook
+        run: |
+          mkdir -p mh_obj
+          for f in buffer hook trampoline; do
+            gcc -c -O2 -I minhook_src/include -I minhook_src/src "minhook_src/src/$f.c" -o "mh_obj/$f.o"
+          done
+          for f in hde32 hde64; do
+            gcc -c -O2 -I minhook_src/include -I minhook_src/src "minhook_src/src/hde/$f.c" -o "mh_obj/$f.o"
+          done
+
+      - name: Build proxy DLL
+        run: |
+          g++ -O2 -std=c++17 -shared -static -static-libgcc -static-libstdc++ \
+            -I third_party/sl2.2 -I minhook_src/include \
+            -o amd_fidelityfx_dx12.dll \
+            src/proxy.cpp src/slbridge.cpp src/nvhook.cpp \
+            mh_obj/buffer.o mh_obj/hook.o mh_obj/trampoline.o mh_obj/hde32.o mh_obj/hde64.o \
+            src/exports.def -lkernel32 -luser32
+          ls -la amd_fidelityfx_dx12.dll
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp amd_fidelityfx_dx12.dll dist/
+          cp fsr2dlss.ini.example dist/fsr2dlss.ini 2>/dev/null || true
+          cp docs/INSTALL.md dist/ 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr2dlss
+          path: dist/
+          if-no-files-found: error
