@@ -1,6 +1,6 @@
 # fsr2dlss
 
-Replaces AMD FSR 3.1 with NVIDIA DLSS in Lies of P. The game's upscaling becomes DLSS
+Replaces AMD FSR 3.1 with NVIDIA DLSS. The game's upscaling becomes DLSS
 Super-Resolution and its frame generation becomes DLSS-G Multi-Frame Generation, all driven through
 NVIDIA Streamline. Built and tested on an RTX 5090.
 
