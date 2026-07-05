@@ -51,10 +51,14 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist
+          mkdir -p dist/streamline
           cp amd_fidelityfx_dx12.dll dist/
-          cp fsr2dlss.ini.example dist/fsr2dlss.ini 2>/dev/null || true
-          cp docs/INSTALL.md dist/ 2>/dev/null || true
+          cp fsr2dlss.ini.example dist/fsr2dlss.ini
+          cp docs/INSTALL.md dist/
+          # Bundle the Streamline plugins (MIT). The nvngx NGX models are proprietary and are
+          # not included; users download them from TechPowerUp (see INSTALL.md).
+          cp runtime/streamline/sl.*.dll dist/streamline/
+          ls -R dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

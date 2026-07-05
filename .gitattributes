@@ -1,0 +1,13 @@
+# Normalize text to LF in the repository; check out LF everywhere except Windows scripts.
+* text=auto eol=lf
+
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Binaries are left untouched.
+*.dll  binary
+*.7z   binary
+*.zip  binary
+*.png  binary
+*.jpg  binary

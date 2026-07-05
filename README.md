@@ -26,14 +26,15 @@ runs underneath it.
 
 ## Install
 
-Full steps are in [docs/INSTALL.md](docs/INSTALL.md). In short: back up the game's
-`amd_fidelityfx_dx12.dll` and rename it to `amd_fidelityfx_dx12.amd.dll`, drop the built proxy in its
-place, create a `streamline\` folder with the Streamline 2.7.4 plugin set (plus the DLSS
-super-resolution plugin and nvngx models), copy `fsr2dlss.ini` next to the proxy, and set the game to
-FSR + Frame Generation. `src/install.ps1` handles the DLL rename.
+Full steps are in [docs/INSTALL.md](docs/INSTALL.md). In short: grab the build artifact (the proxy
+DLL, a sample `fsr2dlss.ini`, and the bundled Streamline plugins), download the two NVIDIA NGX models
+(`nvngx_dlss.dll` and `nvngx_dlssg.dll`) from TechPowerUp, back up the game's
+`amd_fidelityfx_dx12.dll` and rename it to `amd_fidelityfx_dx12.amd.dll`, copy the proxy into its
+place, drop the `streamline\` folder and `fsr2dlss.ini` next to it, and set the game to FSR + Frame
+Generation. It is all plain file copies.
 
-The Streamline and nvngx binaries are NVIDIA redistributables and are not included here; source them
-from a game you own.
+The Streamline plugins are MIT-licensed and ship with the mod. The two NGX models are proprietary
+NVIDIA binaries and are downloaded separately from TechPowerUp (links in the install guide).
 
 ## Build
 
@@ -45,11 +46,12 @@ produces an artifact with the proxy DLL and a sample `fsr2dlss.ini`.
 ## Layout
 
 ```
-src/     proxy.cpp, slbridge.cpp, nvhook.cpp, slbridge.h, exports.def   the mod
-         install.ps1, uninstall.ps1, fg_overlay.ps1, build.ps1          tooling
-         CONTRACT.md   reverse-engineered FfxApi struct offsets
-         SL_SPEC.md    Streamline DLSS-G integration notes
-docs/    ARCHITECTURE.md, INSTALL.md
+src/                 proxy.cpp, slbridge.cpp, nvhook.cpp, slbridge.h, exports.def   the mod
+                     build.ps1, fg_overlay.ps1                                      tooling
+                     CONTRACT.md   reverse-engineered FfxApi struct offsets
+                     SL_SPEC.md    Streamline DLSS-G integration notes
+runtime/streamline/  bundled Streamline plugin DLLs (MIT)
+docs/                ARCHITECTURE.md, INSTALL.md
 ```
 
 ## Credits

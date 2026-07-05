@@ -1,12 +1,16 @@
-# --- toolchain & third-party (download/build separately; see docs/ARCHITECTURE.md) ---
+# Toolchain and third-party (fetch/build separately; see docs/ARCHITECTURE.md)
 /mingw64/
 /sdk/
 /minhook_src/
 /mh_obj/
 /build/
+/dist/
 
-# --- build artifacts ---
+# Build outputs. The bundled Streamline plugins (MIT) under runtime/streamline are the exception.
 *.dll
+!/runtime/streamline/sl.*.dll
+# NGX models are proprietary NVIDIA binaries; download from TechPowerUp.
+nvngx_*.dll
 *.o
 *.obj
 *.exe
@@ -15,21 +19,14 @@
 *.7z
 *.zip
 
-# --- logs, captures, runtime toggles ---
+# Logs and dev scratch
 *.log
-*.flag
-sl_hostver.txt
 fg_fpscap.txt
+logsummary.txt
+mdrive.txt
 
-# --- proprietary NVIDIA redistributables (source from a game you own) ---
-streamline*/
-nvngx_*.dll
-sl.*.dll
-
-# --- editor / OS ---
+# Editor / OS
 .vs/
 .vscode/
 *.user
 Thumbs.db
-logsummary.txt
-mdrive.txt

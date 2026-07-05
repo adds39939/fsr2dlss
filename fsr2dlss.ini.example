@@ -4,7 +4,7 @@
 [FrameGen]
 ; Frame-generation multiplier: 2 = 2x, 3 = 3x, 4 = 4x. 3x and 4x are Multi-Frame Generation and
 ; need an RTX 50-series card. The value is clamped down to whatever the card reports as its maximum.
-Multiplier = 3
+Multiplier = 2
 
 ; Flip metering:
 ;   hardware = the Blackwell display engine paces the generated frames (true 3x/4x MFG). Recommended.

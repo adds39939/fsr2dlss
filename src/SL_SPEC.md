@@ -1,6 +1,6 @@
 # Streamline 2.2.0 DLSS-G integration spec (for the FfxApi proxy) - condensed
 
-COMPILE AGAINST sl2.2 headers (C:\Users\Adam\fsrb\sdk\sl2.2). 2.12 differs (no sl.pcl at 2.2; markers via sl.reflex).
+COMPILE AGAINST the Streamline 2.2 headers in third_party/sl2.2. 2.12 differs (no sl.pcl at 2.2; markers via sl.reflex).
 Feature ids: kFeatureDLSS=0, kFeatureNIS=2, kFeatureReflex=3, kFeatureDLSS_G=1000.
 Functions are C exports of sl.interposer.dll; feature funcs (slDLSSGSetOptions, slReflexSetMarker...) NOT exports -
 resolve via slGetFeatureFunction AFTER slSetD3DDevice. Use PFun_* typedefs from headers for GetProcAddress.

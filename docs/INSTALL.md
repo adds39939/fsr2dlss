@@ -17,34 +17,32 @@ the game and drivers change.
 
 ## 2. Get the files
 
-**The mod DLL.** Download the `fsr2dlss` artifact from the repo's GitHub Actions build. It contains
-`amd_fidelityfx_dx12.dll` and a sample `fsr2dlss.ini`. You can also build it yourself (see
-ARCHITECTURE.md).
+**The mod.** Download the `fsr2dlss` artifact from the repo's GitHub Actions build. It contains the
+proxy `amd_fidelityfx_dx12.dll`, a sample `fsr2dlss.ini`, and a `streamline\` folder with the
+Streamline plugins (`sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`, `sl.dlss_g.dll`,
+`sl.pcl.dll`, `sl.reflex.dll`). Streamline is MIT-licensed, so those ship with the mod. You can also
+build the proxy yourself; see ARCHITECTURE.md.
 
-**The Streamline runtime.** These are NVIDIA binaries, not redistributable, so source them from games
-you own. You need a matched Streamline 2.7.4 frame-generation set plus nvngx 310.1, and the DLSS
-super-resolution plugin:
+**The two NGX models.** DLSS runs from two NVIDIA NGX DLLs that are proprietary and cannot be bundled.
+Download them from TechPowerUp and drop them into the `streamline\` folder alongside the Streamline
+plugins:
 
-```
-sl.interposer.dll   sl.common.dll   sl.dlss_g.dll   sl.pcl.dll   sl.reflex.dll   nvngx_dlssg.dll
-sl.dlss.dll         nvngx_dlss.dll
-```
+- `nvngx_dlss.dll` (super-resolution): https://www.techpowerup.com/download/nvidia-dlss-dll/
+- `nvngx_dlssg.dll` (frame generation): https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/
 
-The 2.7.4 frame-generation plugins and `nvngx_dlssg` 310.1 ship with Black Myth Wukong (under its
-`Engine\Plugins\Runtime\Nvidia\Streamline\Binaries\ThirdParty\Win64`). There is no publicly available
-2.7.4 `sl.dlss`, so take `sl.dlss.dll` (2.7.1) and `nvngx_dlss.dll` from Cyberpunk 2077
-(`bin\x64`); the 2.7.1 super-resolution plugin works fine alongside the 2.7.4 interposer.
+Use version **310.1.0** of each; a newer 310.x build should also work. TechPowerUp lets you pick the
+version from a dropdown, then gives you the DLL to copy into `streamline\`.
 
 ## 3. Install
 
 Let `WIN64` be `...\steamapps\common\Lies of P\LiesofP\Binaries\Win64`, the folder with
-`LOP-Win64-Shipping.exe`.
+`LOP-Win64-Shipping.exe`. Installing is just file copies.
 
 1. Back up `WIN64\amd_fidelityfx_dx12.dll` (the real one, about 6.6 MB) and rename it to
-   `amd_fidelityfx_dx12.amd.dll`. The proxy forwards to it. `src\install.ps1` does this and drops the
-   proxy in.
-2. Copy the proxy `amd_fidelityfx_dx12.dll` into `WIN64`.
-3. Create `WIN64\streamline\` and put the eight files from step 2 into it.
+   `amd_fidelityfx_dx12.amd.dll`. The proxy forwards to it.
+2. Copy the proxy `amd_fidelityfx_dx12.dll` from the artifact into `WIN64`.
+3. Copy the artifact's `streamline\` folder into `WIN64`, then add `nvngx_dlss.dll` and
+   `nvngx_dlssg.dll` from step 2 to it.
 4. Copy `fsr2dlss.ini` into `WIN64`.
 
 The final layout:
@@ -90,15 +88,15 @@ The file sits next to `amd_fidelityfx_dx12.dll`.
 Turn on logging first: set `Debug = true` in `fsr2dlss.ini`, relaunch, and read `WIN64\ffx_bridge.log`
 and `WIN64\streamline\sl.log`.
 
-- **Crash on launch.** Usually the `streamline\` set is incomplete or mismatched. Make sure all the
-  files from step 2 are present, and that the original DLL was renamed to `amd_fidelityfx_dx12.amd.dll`.
+- **Crash on launch.** Usually the `streamline\` folder is incomplete. Make sure all six Streamline
+  plugins and both `nvngx_*.dll` models are present, and that the original DLL was renamed to
+  `amd_fidelityfx_dx12.amd.dll`.
 - **Image looks like FSR, not DLSS.** The super-resolution plugin is not loading. Check that
-  `sl.dlss.dll` is in `streamline\`; the log should print `[SR] DLSS upscale ACTIVE`.
-- **Wrong colors.** A Streamline / model mismatch. Use the matched 2.7.4 set with nvngx 310.1.
+  `sl.dlss.dll` and `nvngx_dlss.dll` are in `streamline\`; the log should print `[SR] DLSS upscale ACTIVE`.
+- **Wrong colors.** A model mismatch. Use `nvngx` version 310.1.0 with the bundled Streamline plugins.
 - **Frame generation not multiplying.** Confirm HAGS is on and that in-game Frame Generation is on.
 
 ## 8. Uninstall
 
-Run `src\uninstall.ps1`, or by hand: delete `amd_fidelityfx_dx12.dll`, rename
-`amd_fidelityfx_dx12.amd.dll` back to `amd_fidelityfx_dx12.dll`, and remove `streamline\`,
-`fsr2dlss.ini`, and any `*.log` files.
+Delete `amd_fidelityfx_dx12.dll`, rename `amd_fidelityfx_dx12.amd.dll` back to
+`amd_fidelityfx_dx12.dll`, and remove `streamline\`, `fsr2dlss.ini`, and any `ffx_bridge.log`.
