@@ -235,8 +235,10 @@ static void doInit()
     logf("loaded real DLL '%ls'  create=%p destroy=%p configure=%p query=%p dispatch=%p\n",
          path, (void*)r_create, (void*)r_destroy, (void*)r_configure, (void*)r_query, (void*)r_dispatch);
 }
+static void startUnhookThread();   // fwd decl (defined near DllMain)
 static void ensure()
 {
+    startUnhookThread();   // idempotent; begins watching for Steam's ffxConfigure hook
     if (g_initState == 2) return;
     if (InterlockedCompareExchange(&g_initState, 1, 0) == 0) {
         doInit();
@@ -276,6 +278,13 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxA
     }
     if (slReady && t == T_FRAMEGEN_CREATE) {
         void* ctx = slbridge_create_framegen(desc);
+        if (ctx) { if (context) *context = ctx; return 0; }
+    }
+    // Optionally substitute the FSR UPSCALE context (0x00010000) so no real AMD FSR upscaler
+    // session is created (test whether Steam's "FSR" label comes from that live session). Gated
+    // by stub_fsr.flag + DLSS-SR on; the upscale dispatch is intercepted for DLSS regardless.
+    if (slReady && t == 0x00010000u && slbridge_want_stub_upscale()) {
+        void* ctx = slbridge_create_upscale();
         if (ctx) { if (context) *context = ctx; return 0; }
     }
     return r_create ? r_create(context, desc, memCb) : 1;
@@ -319,16 +328,17 @@ __declspec(dllexport) ffxReturnCode_t ffxQuery(ffxContext* context, ffxApiHeader
 __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxApiHeader* desc)
 {
     ensure();
-    void* h = derefCtx(context);
-    if (slbridge_is_mine(h)) return slbridge_dispatch(h, desc);
     uint64_t dt = peekType(desc);
-    // The UPSCALE dispatch (0x00010001) is the first FfxApi call of each frame. Open the injected
-    // Reflex frame, then try DLSS super-resolution: if it runs, SKIP AMD's FSR upscale entirely;
-    // if it declines/fails, fall through and forward to AMD (FSR) as a safe fallback.
+    // The UPSCALE dispatch (0x00010001) is the first FfxApi call of each frame. Handle it FIRST,
+    // before is_mine routing, so it always runs through DLSS-SR even when the upscale context is
+    // ours (stubbed). Open the injected Reflex frame, then try DLSS: if it runs, SKIP AMD's FSR;
+    // if it declines, fall through (forwards to AMD when the context is real).
     if (dt == 0x00010001 && g_slState == 2) {
         slbridge_frame_start();
         if (slbridge_upscale(desc)) return 0;   // 0 == FFX_API_RETURN_OK; DLSS did the upscale
     }
+    void* h = derefCtx(context);
+    if (slbridge_is_mine(h)) return slbridge_dispatch(h, desc);
     if (bump(4, dt) <= LOG_CAP) {
         logf("\n>>> ffxDispatch(context=%p -> %p)\n", (void*)context, h);
         if (desc) logChain("Dispatch", desc, DUMP_SZ);
@@ -338,8 +348,52 @@ __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffx
 
 } // extern "C"
 
+// ---- Un-hook Steam's FSR-FG detector ----------------------------------------------------------
+// Steam's overlay (GameOverlayRenderer64.dll) inline-hooks our ffxConfigure export to detect
+// "FSR frame generation" (confirmed verbatim in its strings: it hooks ffxConfigure on
+// amd_fidelityfx_dx12.dll, and slGetNewFrameToken/slDLSSGSetOptions on Streamline for DLSS). When
+// it sees both, FSR wins the label. We own this DLL, so restore our clean ffxConfigure prologue to
+// remove Steam's hook -> it stops seeing the game's FG-configure -> the DLSS-G signal wins -> "DLSS"
+// label, while native stays correct (one slGetNewFrameToken/frame via the shared SR token).
+static unsigned char g_cfgClean[16];
+static void*         g_cfgAddr  = nullptr;
+static bool          g_cfgSaved = false;
+static bool unhookFlag()
+{
+    wchar_t p[MAX_PATH]; selfDir(p, MAX_PATH);
+    wcsncat(p, L"unhook_fsr.flag", MAX_PATH - wcslen(p) - 1);
+    return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+}
+static void restoreFfxConfigure()
+{
+    if (!g_cfgSaved || !g_cfgAddr) return;
+    if (memcmp(g_cfgAddr, g_cfgClean, sizeof(g_cfgClean)) == 0) return;   // not (re)hooked
+    DWORD old;
+    if (VirtualProtect(g_cfgAddr, sizeof(g_cfgClean), PAGE_EXECUTE_READWRITE, &old)) {
+        memcpy(g_cfgAddr, g_cfgClean, sizeof(g_cfgClean));
+        VirtualProtect(g_cfgAddr, sizeof(g_cfgClean), old, &old);
+        FlushInstructionCache(GetCurrentProcess(), g_cfgAddr, sizeof(g_cfgClean));
+        logf("[UNHOOK] removed Steam's inline hook on ffxConfigure (FSR-FG detection suppressed)\n");
+    }
+}
+static DWORD WINAPI unhookThread(LPVOID)
+{
+    for (;;) { if (unhookFlag()) restoreFfxConfigure(); Sleep(100); }
+}
+static void startUnhookThread()
+{
+    static LONG started = 0;
+    if (InterlockedCompareExchange(&started, 1, 0) == 0)
+        CloseHandle(CreateThread(nullptr, 0, unhookThread, nullptr, 0, nullptr));
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH) { g_self = inst; DisableThreadLibraryCalls(inst); }
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_self = inst; DisableThreadLibraryCalls(inst);
+        // Save our clean ffxConfigure prologue NOW (before Steam gets a chance to hook it).
+        g_cfgAddr = (void*)GetProcAddress(inst, "ffxConfigure");
+        if (g_cfgAddr) { memcpy(g_cfgClean, g_cfgAddr, sizeof(g_cfgClean)); g_cfgSaved = true; }
+    }
     return TRUE;
 }

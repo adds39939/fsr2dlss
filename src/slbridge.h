@@ -20,6 +20,14 @@ void* slbridge_create_swapchain(void* oldDesc, void* factory, void* queue, void*
 // Returns an opaque context handle (never forwarded to AMD).
 void* slbridge_create_framegen(const void* createDescChain);
 
+// Substitute the game's FSR UPSCALE context (0x00010000) with a dummy so NO real AMD FSR
+// upscaler session is ever created (Steam may label "FSR" from that live session). We already
+// run DLSS on the upscale dispatch, so AMD's upscaler is unused. Returns a dummy handle.
+void* slbridge_create_upscale(void);
+// True when we should stub the UPSCALE context: opt-in via stub_fsr.flag AND DLSS-SR active
+// (else we still need AMD's real upscaler). Read live.
+bool  slbridge_want_stub_upscale(void);
+
 // Is this ffxContext handle one we own?
 bool  slbridge_is_mine(void* handle);
 
