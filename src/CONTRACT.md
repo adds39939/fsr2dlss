@@ -1,4 +1,4 @@
-# Lies of P FfxApi (FSR 3.1.1) runtime contract — empirical + struct model
+# Lies of P FfxApi (FSR 3.1.1) runtime contract - empirical + struct model
 
 Captured from a real game run (ffx_bridge.log). Display 3840x2160, HDR (R10G10B10A2 backbuffer),
 depth INVERTED + INFINITE far. FG-context flags = 0x38 = DEPTH_INVERTED|DEPTH_INFINITE|HIGH_DYNAMIC_RANGE.

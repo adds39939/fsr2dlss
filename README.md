@@ -1,49 +1,58 @@
 # fsr2dlss
 
-Replace **AMD FSR 3.1** with **NVIDIA DLSS + DLSS Frame Generation (DLSS‑G)** in games built on
-AMD's unified FidelityFX API (`amd_fidelityfx_dx12.dll`). Proven end‑to‑end on **Lies of P**
-(UE4 / D3D12 / HDR10) on an **RTX 5090 (Blackwell)**.
+Replaces AMD FSR 3.1 with NVIDIA DLSS in Lies of P. The game's upscaling becomes DLSS
+Super-Resolution and its frame generation becomes DLSS-G Multi-Frame Generation, all driven through
+NVIDIA Streamline. Built and tested on an RTX 5090.
 
-It's a transparent proxy of `amd_fidelityfx_dx12.dll`: it forwards untouched calls to the renamed
-real DLL and translates the upscale + frame‑generation work to NVIDIA Streamline. The game keeps
-thinking it runs FSR; DLSS runs underneath.
+The mod is a proxy for `amd_fidelityfx_dx12.dll`. The game loads it by name, so it forwards the
+calls it doesn't care about to the renamed real AMD DLL and translates the upscale and
+frame-generation work to Streamline. As far as the game is concerned it is still running FSR; DLSS
+runs underneath it.
 
-## Status: ✅ working
+## What you get
 
-- **DLSS Super‑Resolution** replaces the FSR upscale (auto‑picks DLAA/Quality/Balanced/… from the
-  in‑game preset).
-- **DLSS Frame Generation** replaces FSR frame gen — confirmed doubling
-  (`numFramesActuallyPresented == 2`) and by NVIDIA's on‑screen indicators.
+- DLSS Super-Resolution instead of FSR. The DLSS quality mode is chosen from the in-game FSR preset:
+  a lower preset gives more upscaling and more frames, native resolution gives DLAA.
+- DLSS-G frame generation. On an RTX 50-series card this is true 3x Multi-Frame Generation running on
+  Blackwell hardware flip metering (roughly 75 fps rendered turns into 225 fps displayed). 2x and 4x
+  are available through the `Multiplier` setting.
+- The Steam overlay reports DLSS with the correct native and generated frame counts.
 
-The novel result is getting **real DLSS‑G to engage under injection on Blackwell**, which required
-an **intermediate Streamline version (2.7.1)** plus a **flip‑metering block**. See
-**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full story and design.
+## Requirements
 
-## Repo layout
+- An RTX 50-series GPU for 3x/4x MFG, a recent NVIDIA driver, and Hardware-Accelerated GPU Scheduling
+  turned on in Windows.
+- Windows 10 or 11, DirectX 12, and a copy of Lies of P.
+
+## Install
+
+Full steps are in [docs/INSTALL.md](docs/INSTALL.md). In short: back up the game's
+`amd_fidelityfx_dx12.dll` and rename it to `amd_fidelityfx_dx12.amd.dll`, drop the built proxy in its
+place, create a `streamline\` folder with the Streamline 2.7.4 plugin set (plus the DLSS
+super-resolution plugin and nvngx models), copy `fsr2dlss.ini` next to the proxy, and set the game to
+FSR + Frame Generation. `src/install.ps1` handles the DLL rename.
+
+The Streamline and nvngx binaries are NVIDIA redistributables and are not included here; source them
+from a game you own.
+
+## Build
+
+Needs MinGW-w64 GCC, the Streamline SDK headers under `third_party/sl2.2`, and
+[MinHook](https://github.com/TsudaKageyu/minhook). Run `src/build.ps1`, or check
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the exact compile line. The GitHub Actions build
+produces an artifact with the proxy DLL and a sample `fsr2dlss.ini`.
+
+## Layout
 
 ```
-src/        proxy.cpp, slbridge.cpp, nvhook.cpp, slbridge.h, exports.def   (the mod)
-            install.ps1, uninstall.ps1, fg_overlay.ps1, build.ps1          (tooling)
-            CONTRACT.md   (reverse-engineered FfxApi struct offsets)
-            SL_SPEC.md    (Streamline DLSS-G integration notes)
-docs/       ARCHITECTURE.md   (how it works — read this first)
+src/     proxy.cpp, slbridge.cpp, nvhook.cpp, slbridge.h, exports.def   the mod
+         install.ps1, uninstall.ps1, fg_overlay.ps1, build.ps1          tooling
+         CONTRACT.md   reverse-engineered FfxApi struct offsets
+         SL_SPEC.md    Streamline DLSS-G integration notes
+docs/    ARCHITECTURE.md, INSTALL.md
 ```
-
-## Build (summary — see docs/ARCHITECTURE.md §8)
-
-Needs MinGW‑w64 GCC, the NVIDIA Streamline 2.2 SDK headers, and [MinHook](https://github.com/TsudaKageyu/minhook).
-None are committed. Then `g++ … proxy.cpp slbridge.cpp nvhook.cpp mh_obj/*.o exports.def` (or `src/build.ps1`).
-
-## Install (summary — see docs/ARCHITECTURE.md §9)
-
-1. Run `src/install.ps1` (backs up the game's real DLL, installs the proxy).
-2. Provide a **matched Streamline 2.7.1** runtime in the game's `streamline\` folder
-   (`sl.*` 2.7.1 + `nvngx_dlss`/`nvngx_dlssg` 310.1) — source these from a game you own (e.g.
-   Cyberpunk 2077). **Not committed** (NVIDIA redistributables).
-3. Create `sl_hostver.txt` containing `2.7.1`.
-4. In‑game: Upscaling = **FSR**, Frame Generation = **ON**.
 
 ## Credits
 
-Concept from LukeFZ's dead "FSR2Streamline". Uses NVIDIA Streamline (MIT) and MinHook (MIT).
-The flip‑metering block mirrors OptiScaler's `DisableFlipMetering`. NVIDIA binaries not included.
+The idea traces back to LukeFZ's FSR2Streamline; this is a from-scratch rebuild for the FSR 3.1
+FidelityFX API. Uses NVIDIA Streamline and MinHook (both MIT). NVIDIA binaries are not included.

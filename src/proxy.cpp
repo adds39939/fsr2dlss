@@ -1,12 +1,13 @@
 // ============================================================================
-// FSR3.1 -> DLSS/DLSS-G bridge  ::  Phase 2 logging proxy
+// FfxApi proxy for amd_fidelityfx_dx12.dll.
 //
-// Drop-in replacement for amd_fidelityfx_dx12.dll. Forwards the 5 unified
-// FfxApi entry points to the real (renamed) DLL and logs every call: the
-// desc 'type', the pNext chain, and a bounded hexdump of each desc. This
-// empirically captures exactly how Lies of P drives FSR 3.1 (which effects,
-// which desc types, struct layout) so the translation layer can be built
-// against ground truth instead of guessed header versions.
+// This is the DLL the game loads by name. It exports the five FfxApi entry
+// points, forwards anything it does not handle to the renamed real AMD DLL
+// (amd_fidelityfx_dx12.amd.dll), and routes the interesting calls to the
+// Streamline bridge in slbridge.cpp: the frame-generation swapchain becomes a
+// DLSS-G swapchain, the upscale dispatch runs DLSS, and the frame-gen dispatches
+// feed DLSS-G. It also keeps the Steam overlay reporting DLSS by removing Steam's
+// inline hook on our ffxConfigure export. Optional file logging is off by default.
 // ============================================================================
 #include <windows.h>
 #include <cstdint>
@@ -176,7 +177,7 @@ static uint64_t peekType(const ffxApiHeader* h)
     return h->type;
 }
 
-// ---- Streamline routing (Phase 4) ------------------------------------------
+// ---- Streamline routing ----------------------------------------------------
 // Logger handed to slbridge.cpp (it appends its own newline).
 extern "C" void bridge_logs(const char* s)
 {

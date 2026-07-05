@@ -1,124 +1,104 @@
-# Installing fsr2dlss (Lies of P)
+# Installing fsr2dlss
 
-Replaces the game's AMD FSR 3.1 upscaling + frame generation with **NVIDIA DLSS + DLSS‑G**.
-Tested on **Lies of P** on an **RTX 5090**. Other FSR 3.1 (FfxApi) games may work but are untested.
+This replaces Lies of P's FSR 3.1 upscaling and frame generation with NVIDIA DLSS and DLSS-G. It has
+been tested on Lies of P on an RTX 5090. Other FSR 3.1 games that use the same FidelityFX API might
+work but are untested.
 
-> ⚠️ This is an unofficial mod that replaces a game DLL. Back up first, use at your own risk, and
-> expect to keep it updated as the game/driver changes.
-
----
+This is an unofficial mod that swaps a game DLL. Back up the original first and expect to update it as
+the game and drivers change.
 
 ## 1. Requirements
 
-- **NVIDIA RTX GPU** with DLSS Frame Generation support (RTX 40‑series or 50‑series). 3×/4× MFG
-  needs RTX 50‑series.
-- Recent NVIDIA driver.
-- **Hardware‑accelerated GPU Scheduling (HAGS) = On** (Windows Settings → System → Display →
-  Graphics → *Default graphics settings*). Reboot if you change it.
-- Windows 10/11, DirectX 12.
-- A copy of **Lies of P**.
-
----
+- An RTX 50-series GPU. Frame generation needs one, and 3x/4x Multi-Frame Generation is 50-series only.
+- A recent NVIDIA driver.
+- Hardware-Accelerated GPU Scheduling turned on: Windows Settings, System, Display, Graphics, Default
+  graphics settings. Reboot after changing it.
+- Windows 10 or 11, DirectX 12, and a copy of Lies of P.
 
 ## 2. Get the files
 
-### a) The mod DLL
-Download the latest **`fsr2dlss`** artifact from the repo's GitHub Actions **Build** run (it contains
-`amd_fidelityfx_dx12.dll` + a sample `fsr2dlss.ini`). Or build it yourself — see
-[ARCHITECTURE.md §8](ARCHITECTURE.md#8-build).
+**The mod DLL.** Download the `fsr2dlss` artifact from the repo's GitHub Actions build. It contains
+`amd_fidelityfx_dx12.dll` and a sample `fsr2dlss.ini`. You can also build it yourself (see
+ARCHITECTURE.md).
 
-### b) The Streamline 2.7.1 runtime (NVIDIA binaries — not distributable, source from a game you own)
-You need a **matched Streamline 2.7.1 set + nvngx 310.1**. The known‑good source is **Cyberpunk 2077**
-(`…\Cyberpunk 2077\bin\x64\`). Copy these files:
+**The Streamline runtime.** These are NVIDIA binaries, not redistributable, so source them from games
+you own. You need a matched Streamline 2.7.4 frame-generation set plus nvngx 310.1, and the DLSS
+super-resolution plugin:
 
 ```
-sl.interposer.dll   sl.common.dll   sl.dlss.dll   sl.dlss_g.dll   sl.pcl.dll   sl.reflex.dll
-nvngx_dlss.dll      nvngx_dlssg.dll
+sl.interposer.dll   sl.common.dll   sl.dlss_g.dll   sl.pcl.dll   sl.reflex.dll   nvngx_dlssg.dll
+sl.dlss.dll         nvngx_dlss.dll
 ```
 
-Verify their versions: `sl.*` should be **2.7.1**, `nvngx_*` should be **310.1**. They must all match.
-
----
+The 2.7.4 frame-generation plugins and `nvngx_dlssg` 310.1 ship with Black Myth Wukong (under its
+`Engine\Plugins\Runtime\Nvidia\Streamline\Binaries\ThirdParty\Win64`). There is no publicly available
+2.7.4 `sl.dlss`, so take `sl.dlss.dll` (2.7.1) and `nvngx_dlss.dll` from Cyberpunk 2077
+(`bin\x64`); the 2.7.1 super-resolution plugin works fine alongside the 2.7.4 interposer.
 
 ## 3. Install
 
-Let `WIN64 = …\steamapps\common\Lies of P\LiesofP\Binaries\Win64` (where `LOP-Win64-Shipping.exe` is).
+Let `WIN64` be `...\steamapps\common\Lies of P\LiesofP\Binaries\Win64`, the folder with
+`LOP-Win64-Shipping.exe`.
 
-1. **Back up** `WIN64\amd_fidelityfx_dx12.dll` (the real one, ~6.6 MB).
-2. **Rename** it to `amd_fidelityfx_dx12.amd.dll` (the proxy forwards to this).
-   *(Or just run `src/install.ps1`, which does steps 1–2 automatically and drops the proxy in.)*
-3. **Copy the proxy** `amd_fidelityfx_dx12.dll` (from the artifact) into `WIN64\`.
-4. **Create `WIN64\streamline\`** and put the 8 Streamline/nvngx files from step 2b into it.
-5. **Copy `fsr2dlss.ini`** into `WIN64\` (see §5 to configure).
+1. Back up `WIN64\amd_fidelityfx_dx12.dll` (the real one, about 6.6 MB) and rename it to
+   `amd_fidelityfx_dx12.amd.dll`. The proxy forwards to it. `src\install.ps1` does this and drops the
+   proxy in.
+2. Copy the proxy `amd_fidelityfx_dx12.dll` into `WIN64`.
+3. Create `WIN64\streamline\` and put the eight files from step 2 into it.
+4. Copy `fsr2dlss.ini` into `WIN64`.
 
-Final layout:
+The final layout:
+
 ```
 WIN64\
-  amd_fidelityfx_dx12.dll        <- the mod (proxy)
-  amd_fidelityfx_dx12.amd.dll    <- the original AMD DLL (backup the proxy forwards to)
+  amd_fidelityfx_dx12.dll        the mod (proxy)
+  amd_fidelityfx_dx12.amd.dll    the original AMD DLL the proxy forwards to
   fsr2dlss.ini
   streamline\
     sl.interposer.dll  sl.common.dll  sl.dlss.dll  sl.dlss_g.dll
     sl.pcl.dll         sl.reflex.dll  nvngx_dlss.dll  nvngx_dlssg.dll
 ```
 
----
+## 4. In-game settings
 
-## 4. In‑game settings
+In the graphics options set Upscaling / Super Resolution to FSR (any preset) and turn Frame
+Generation on. The mod swaps FSR for DLSS underneath and picks the matching DLSS quality mode from the
+preset you chose. The game still shows FSR in its menu; that is expected.
 
-Launch the game and in the video/graphics options:
+## 5. Configure fsr2dlss.ini
 
-- **Upscaling / Super Resolution = FSR** (any quality preset — the mod swaps it to DLSS and
-  auto‑selects the matching DLSS mode; a lower FSR preset = DLSS upscaling for more FPS, native = DLAA).
-- **Frame Generation = ON**.
-
-The game still *thinks* it's running FSR; DLSS runs underneath. (Steam's overlay may label it "FSR" —
-that's cosmetic; it reads the menu setting, not what's actually running.)
-
----
-
-## 5. Configure `fsr2dlss.ini`
-
-Place it next to `amd_fidelityfx_dx12.dll`. Key settings (full docs in the file):
+The file sits next to `amd_fidelityfx_dx12.dll`.
 
 | Setting | Values | Notes |
 |---|---|---|
-| `Multiplier` | `2` / `3` / `4` | Frame‑gen multiplier. 3×/4× need RTX 50; clamped to card max. |
-| `DLSS` | `true` / `false` | DLSS upscaling on, or pass through to FSR. |
-| `FlipMetering` | `software` / `hardware` / `auto` | Leave `software` (hardware doesn't insert frames under injection yet). |
-| `HostVersion` | `2.7.1` | Must match the `streamline\` plugin versions. |
-| `HudlessTags` | `false` | Experimental; leave off for baked‑UI games. |
+| `Multiplier` | `2`, `3`, `4` | Frame-gen multiplier. Clamped to the card's maximum. |
+| `FlipMetering` | `hardware`, `software` | `hardware` gives true 3x/4x MFG. `software` is clean 2x. |
+| `DLSS` | `true`, `false` | DLSS upscaling on, or pass through to FSR. |
+| `SteamOverlayFix` | `true`, `false` | Make the Steam overlay report DLSS with correct counts. |
+| `HudlessTags` | `false` | Experimental. Leave off for this game. |
+| `Debug` | `false` | Write `ffx_bridge.log`. Leave off unless troubleshooting. |
 
----
+## 6. Verify it is working
 
-## 6. Verify it's working
-
-- **In‑game feel:** framerate goes up with Frame Generation on; DLSS looks sharper/cleaner than FSR.
-- **NVIDIA on‑screen indicators (definitive):** run `src/fg_overlay.ps1` **as administrator** once —
-  it enables NVIDIA's DLSS + DLSS‑G indicators. Relaunch: you should see NVIDIA's "DLSS Frame
-  Generation" indicator (top) and DLSS super‑resolution indicator. Remove later with
-  `fg_overlay.ps1 -Off`.
-- **Log:** `WIN64\ffx_bridge.log` should show `[SR] DLSS upscale ACTIVE`, `[FGC] … presented=2`
-  (or 3/4 for MFG), and `[CFG] fsr2dlss.ini: …`. `WIN64\streamline\sl.log` shows `sl.dlss` +
-  `sl.dlss_g` plugins loaded.
-
----
+- The framerate roughly triples with Frame Generation on, and the image looks cleaner than FSR.
+- The Steam overlay shows DLSS with a native and a generated frame count.
+- For a definitive check, run `src\fg_overlay.ps1` as administrator once to enable NVIDIA's on-screen
+  DLSS and DLSS-G indicators, then relaunch. Remove them later with `fg_overlay.ps1 -Off`.
 
 ## 7. Troubleshooting
 
-- **Fatal error / crash on launch:** usually a Streamline version mismatch. Ensure all `sl.*` are
-  2.7.1 and `HostVersion = 2.7.1`. Ensure the original DLL was renamed to `amd_fidelityfx_dx12.amd.dll`.
-- **Image is "fizzly"/looks like FSR:** DLSS‑SR isn't loading — check `sl.dlss.dll` is present in
-  `streamline\` and `[SR] DLSS upscale ACTIVE` appears in the log. (Missing `sl.dlss.dll` is the #1 cause.)
-- **Red/wrong colors:** Streamline/model mismatch — use the matched 2.7.1 + 310.1 set.
-- **Frame gen not doubling:** confirm HAGS is on; check `presented=2` in the log; make sure in‑game
-  Frame Generation is ON.
-- **1 fps crawl:** you're on a Streamline version that doesn't engage under injection — use 2.7.1.
+Turn on logging first: set `Debug = true` in `fsr2dlss.ini`, relaunch, and read `WIN64\ffx_bridge.log`
+and `WIN64\streamline\sl.log`.
 
----
+- **Crash on launch.** Usually the `streamline\` set is incomplete or mismatched. Make sure all the
+  files from step 2 are present, and that the original DLL was renamed to `amd_fidelityfx_dx12.amd.dll`.
+- **Image looks like FSR, not DLSS.** The super-resolution plugin is not loading. Check that
+  `sl.dlss.dll` is in `streamline\`; the log should print `[SR] DLSS upscale ACTIVE`.
+- **Wrong colors.** A Streamline / model mismatch. Use the matched 2.7.4 set with nvngx 310.1.
+- **Frame generation not multiplying.** Confirm HAGS is on and that in-game Frame Generation is on.
 
 ## 8. Uninstall
 
-Run `src/uninstall.ps1`, or manually: delete `amd_fidelityfx_dx12.dll`, rename
+Run `src\uninstall.ps1`, or by hand: delete `amd_fidelityfx_dx12.dll`, rename
 `amd_fidelityfx_dx12.amd.dll` back to `amd_fidelityfx_dx12.dll`, and remove `streamline\`,
-`fsr2dlss.ini`, and the `*.log` files.
+`fsr2dlss.ini`, and any `*.log` files.

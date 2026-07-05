@@ -1,8 +1,8 @@
-// nvhook.cpp — NvAPI interposer. Optionally disable Blackwell hardware flip metering so DLSS-G
-// falls back to its software pacer: return null for NvAPI_D3D12_SetFlipConfig (id 0xF3148C42) when
-// FlipMetering != hardware. With FlipMetering=hardware (default) we don't block, and the display
-// engine's hardware flip queue paces the generated frames (true 3x/4x MFG).
-// Ref: OptiScaler nvapi/NvApiHooks.cpp; NVIDIA nvapi_interface.h { "NvAPI_D3D12_SetFlipConfig", 0xf3148c42 }.
+// nvhook.cpp - small NvAPI interposer. It only exists to control Blackwell flip metering: when
+// FlipMetering != hardware we hide NvAPI_D3D12_SetFlipConfig (id 0xF3148C42) from Streamline, which
+// makes DLSS-G fall back to its software pacer (clean 2x). With FlipMetering=hardware (default) we
+// let the call through and the display engine's hardware flip queue paces the generated frames
+// (true 3x/4x MFG). We hook nvapi_QueryInterface to intercept that one function id.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>

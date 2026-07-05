@@ -1,8 +1,8 @@
-# Streamline 2.2.0 DLSS-G integration spec (for the FfxApi proxy) — condensed
+# Streamline 2.2.0 DLSS-G integration spec (for the FfxApi proxy) - condensed
 
 COMPILE AGAINST sl2.2 headers (C:\Users\Adam\fsrb\sdk\sl2.2). 2.12 differs (no sl.pcl at 2.2; markers via sl.reflex).
 Feature ids: kFeatureDLSS=0, kFeatureNIS=2, kFeatureReflex=3, kFeatureDLSS_G=1000.
-Functions are C exports of sl.interposer.dll; feature funcs (slDLSSGSetOptions, slReflexSetMarker...) NOT exports —
+Functions are C exports of sl.interposer.dll; feature funcs (slDLSSGSetOptions, slReflexSetMarker...) NOT exports -
 resolve via slGetFeatureFunction AFTER slSetD3DDevice. Use PFun_* typedefs from headers for GetProcAddress.
 
 ## Init (once, on first ffxCreateContext; device from backend desc 0x00000002 +0x10)
@@ -28,14 +28,14 @@ resolve via slGetFeatureFunction AFTER slSetD3DDevice. Use PFun_* typedefs from 
 - options: DLSSGOptions{mode=eOn} (2.2: {eOff,eOn}); slDLSSGSetOptions(vp{0},opt).
 - tags via slSetTag(vp, tags, n, cmdList): kBufferTypeDepth=0, kBufferTypeMotionVectors=1 REQUIRED;
   HUDLessColor=2 + UIColorAndAlpha=23 recommended (UI not R10G10B10A2). lifecycle=eValidUntilPresent.
-  Resource{eTex2d, ptr, D3D12_RESOURCE_STATES state} — state must be correct at Present.
+  Resource{eTex2d, ptr, D3D12_RESOURCE_STATES state} - state must be correct at Present.
   -> depth+MV from FRAMEGEN PREPARE 0x00020004; HUDLessColor from FRAMEGEN CONFIGURE 0x00020002.
 - constants (sl_consts Constants v1) via slSetConstants(c, *frame, vp): REQUIRED cameraViewToClip, clipToCameraView,
   clipToPrevClip, prevClipToClip; jitterOffset(px); mvecScale (NDC: {1/W,1/H} if MV in px, {1,1} if NDC);
   cameraPos/Up/Right/Fwd; cameraNear/Far/FOV/AspectRatio; depthInverted=eTrue; cameraMotionIncluded=eTrue;
   reset on cut. FFX gives near/far/fov ONLY -> build projection from fov+aspect+near/far(inverted,infinite);
   clipToPrevClip=identity + cameraMotionIncluded=eTrue (MVs carry camera motion). garbage->eFailCommonConstantsInvalid.
-- frame token: slGetNewFrameToken(ft, &gameFrameIndex) — index MUST match across constants/tags/markers.
+- frame token: slGetNewFrameToken(ft, &gameFrameIndex) - index MUST match across constants/tags/markers.
 - Reflex (MANDATORY for DLSS-G): once slReflexSetOptions{mode=eLowLatency}. each frame, same ft:
   slReflexSleep(*ft); markers eSimulationStart/End, eRenderSubmitStart/End, ePresentStart .. Present .. ePresentEnd.
   ReflexMarker enum(2.2): eSimulationStart=0,eSimulationEnd,eRenderSubmitStart,eRenderSubmitEnd,ePresentStart,ePresentEnd,...
@@ -45,6 +45,6 @@ resolve via slGetFeatureFunction AFTER slSetD3DDevice. Use PFun_* typedefs from 
   LoP FG backBufferFormat captured = 17 (R10G10B10A2) -> OK. Confirm swapchain DESC format; force HDR10 if needed.
 - No MSAA backbuffer. GetCurrentBackBufferIndex each frame. HAGS on if eHardwareSchedulingRequired.
 - Production interposer verifies PLUGIN signatures (user's are NV-signed -> ok). Host (our DLL) not checked.
-- Interpolation is INTERNAL to SL Present — no interpolation cmdlist/texture to hand back. The game's per-frame
+- Interpolation is INTERNAL to SL Present - no interpolation cmdlist/texture to hand back. The game's per-frame
   FGSWAP queries 0x00030003 (InterpolationCommandList) / 0x00030004 (InterpolationTexture) must be satisfied with
   throwaway objects (a real but ignored cmd list + a dummy texture) so the game's FFX FG dispatch path doesn't crash.
