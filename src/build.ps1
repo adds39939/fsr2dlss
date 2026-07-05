@@ -27,6 +27,6 @@ foreach ($f in @("hde32","hde64")) {
     -o $out `
     "$src\proxy.cpp" "$src\slbridge.cpp" "$src\nvhook.cpp" `
     "$mhobj\buffer.o" "$mhobj\hook.o" "$mhobj\trampoline.o" "$mhobj\hde32.o" "$mhobj\hde64.o" `
-    "$src\exports.def" -lkernel32 -luser32 -ladvapi32
+    "$src\exports.def" -lkernel32 -luser32
 if ($LASTEXITCODE -ne 0) { Write-Error "build failed ($LASTEXITCODE)"; exit 1 }
 "BUILD OK -> $out  ($((Get-Item $out).Length) bytes)"

@@ -28,7 +28,6 @@
 extern "C" void bridge_logs(const char* s);
 extern "C" bool nvhook_install();             // nvhook.cpp — hook nvapi_QueryInterface (markers + flip block)
 extern "C" void nvhook_set_flip_block(bool);  // block SetFlipConfig (software pacing) or not
-extern "C" void nvhook_set_oob_inject(int);   // synthesize N OUT_OF_BAND_PRESENT pairs/frame (Steam DLSS-G signature); 0=off
 static void L(const char* fmt, ...)
 {
     char buf[1400];
@@ -78,8 +77,8 @@ struct Config {
     bool dlssSR       = true;   // false -> pass upscale through to FSR
     bool hudlessTags  = false;  // best-effort HUDLessColor/UI tags (game bakes UI, so experimental)
     char hostVer[16]  = "2.7.1";// SL host SDK version reported to slInit
-    int  fpsCap       = 0;      // (legacy, unused for auto-cap) manual Reflex cap via fg_fpscap.txt still works
     int  dlssgStruct  = 0;      // DLSSGOptions structVersion: 0=auto(by host ver) | 1/3/5 = force
+    bool steamFix     = true;   // DLSS-SR takes its own frame token so the Steam overlay reports "DLSS"
     bool loaded       = false;
 };
 static Config g_cfg;
@@ -115,12 +114,12 @@ static void loadConfig()
         else if (!strcmp(key,"dlss"))           g_cfg.dlssSR = cfgBool(val);
         else if (!strcmp(key,"hudlesstags"))    g_cfg.hudlessTags = cfgBool(val);
         else if (!strcmp(key,"hostversion"))  { strncpy(g_cfg.hostVer,val,sizeof(g_cfg.hostVer)-1); g_cfg.hostVer[sizeof(g_cfg.hostVer)-1]=0; }
-        else if (!strcmp(key,"fpscap"))       { if (!_stricmp(val,"off")) g_cfg.fpsCap=-1; else if (!_stricmp(val,"auto")) g_cfg.fpsCap=0; else g_cfg.fpsCap=atoi(val); }
         else if (!strcmp(key,"dlssgstruct"))  { if (!_stricmp(val,"auto")) g_cfg.dlssgStruct=0; else { int v=atoi(val); if (v==1||v==3||v==5) g_cfg.dlssgStruct=v; } }
+        else if (!strcmp(key,"steamoverlayfix")) g_cfg.steamFix = cfgBool(val);
     }
     fclose(f);
-    L("[CFG] fsr2dlss.ini: multiplier=%dx flipMetering=%d dlssSR=%d hudlessTags=%d dlssgStruct=%d host=%s",
-      g_cfg.fgMultiplier, g_cfg.flipMode, (int)g_cfg.dlssSR, (int)g_cfg.hudlessTags, g_cfg.dlssgStruct, g_cfg.hostVer);
+    L("[CFG] fsr2dlss.ini: multiplier=%dx flipMetering=%d dlssSR=%d hudlessTags=%d dlssgStruct=%d steamFix=%d host=%s",
+      g_cfg.fgMultiplier, g_cfg.flipMode, (int)g_cfg.dlssSR, (int)g_cfg.hudlessTags, g_cfg.dlssgStruct, (int)g_cfg.steamFix, g_cfg.hostVer);
 }
 
 // ---- minimal FfxApi types we parse (layouts verified from runtime) ----------
@@ -200,8 +199,6 @@ static uint32_t g_doubledFrames  = 0;         // # frames where presented >= 2
 static int      g_lastAppliedMode = -1;       // last DLSSGMode applied (-1 = never)
 static uint32_t g_frameIdx       = 0;         // monotonic SL frame index (one token per frame)
 static uint32_t g_curFrameID     = 0xFFFFFFFF; // game's frameID for the current SL token (OptiScaler model)
-static bool     g_nativeToken    = false;      // sr_native_token.flag: open the frame token at UPSCALE so DLSS-SR + DLSS-G share it (native pattern)
-static bool     g_frameTokenReady = false;     // frame_start opened the token for this frame; feedDLSSG reuses it
 static unsigned g_presentCount   = 0;         // presents seen (warmup gate for the Reflex sleep)
 static const unsigned WARMUP_PRESENTS = 120;  // skip the throttling sleep during fragile SL/swapchain init
 static bool     g_lastAppliedInterp = false;  // last interp-only flag applied
@@ -267,7 +264,7 @@ static sl::float4x4 ident4()
 }
 
 // ---- bridge contexts --------------------------------------------------------
-enum CtxKind { CTX_SWAPCHAIN = 1, CTX_FRAMEGEN = 2, CTX_UPSCALE = 3 };
+enum CtxKind { CTX_SWAPCHAIN = 1, CTX_FRAMEGEN = 2 };
 struct BridgeCtx {
     uint32_t magic;            // 'FBRG'
     CtxKind  kind;
@@ -804,26 +801,6 @@ extern "C" void* slbridge_create_framegen(const void* /*createDescChain*/)
     return c;
 }
 
-extern "C" void* slbridge_create_upscale(void)
-{
-    if (!g_slReady) return nullptr;
-    BridgeCtx* c = new BridgeCtx();
-    c->magic = CTX_MAGIC; c->kind = CTX_UPSCALE;
-    registerCtx(c);
-    L("[SR] upscale context SUBSTITUTED (dummy; no real AMD FSR upscaler session created) ctx=%p", (void*)c);
-    return c;
-}
-
-extern "C" bool slbridge_want_stub_upscale(void)
-{
-    // Opt-in (stub_fsr.flag) + only when DLSS-SR is on (we replace AMD's upscaler); else we still
-    // need the real AMD upscaler as the fallback. Read the flag live (cheap, few calls at startup).
-    static int scan = 0; static bool s_stub = false;
-    if ((scan++ % 8) == 0)
-        s_stub = (GetFileAttributesW(modPath(L"stub_fsr.flag")) != INVALID_FILE_ATTRIBUTES);
-    return s_stub && g_cfg.dlssSR;
-}
-
 // ---- desc field readers (descs are valid game memory) -----------------------
 static uint32_t rdU32(const void* b, size_t o){ return *(const uint32_t*)((const char*)b+o); }
 static uint64_t rdU64(const void* b, size_t o){ return *(const uint64_t*)((const char*)b+o); }
@@ -835,28 +812,10 @@ static const uint64_t T_FG_PREPARE   = 0x00020004;
 static const uint64_t T_FG_DISPATCH  = 0x00020003;
 
 // Frame start: called from the proxy on the first FfxApi call of the frame (UPSCALE dispatch).
-// Opens the Reflex frame with eSimulationStart on this frame's token (the token was created at
-// the previous frame's post-present; bootstrap it on the very first frame).
 extern "C" void slbridge_frame_start()
 {
-    // Native single-token mode (sr_native_token.flag): open the Reflex frame HERE, at the UPSCALE
-    // dispatch (the frame's first FfxApi call), so DLSS-SR evaluates on the SAME frame token that
-    // DLSS-G will use — the pattern a native DLSS-SR+DLSS-G title emits, which lets the Steam
-    // overlay register the DLSS upscaler on the current frame (correct label) with one native frame
-    // per real frame (correct count). feedDLSSG reuses this token. Default (flag absent): stay a
-    // no-op and let feedDLSSG open the frame (proven-working 3x path; DLSS-SR rides the prior token).
-    if (!g_slReady || !p_slGetNewFrameToken) return;
-    static int scan = 0;
-    if ((scan++ % 120) == 0)
-        g_nativeToken = (GetFileAttributesW(modPath(L"sr_native_token.flag")) != INVALID_FILE_ATTRIBUTES);
-    if (!g_nativeToken) return;
-    uint32_t idx = ++g_frameIdx;
-    sl::FrameToken* t = nullptr;
-    if (p_slGetNewFrameToken(t, &idx) == sl::Result::eOk && t) {
-        g_curToken = t;
-        g_frameTokenReady = true;
-        mark(PCL_SimStart, t);   // frame opens on this token
-    }
+    // No-op: the frame token + all Reflex/PCL markers are driven from feedDLSSG, keyed by the
+    // game's frameID (the UPSCALE dispatch has no frameID to key on).
 }
 
 // Feed DLSS-G from the FRAMEGEN PREPARE dispatch (depth + MV + camera scalars).
@@ -882,26 +841,17 @@ static void feedDLSSG(const void* d)
     // same frame. Advance the token only when the game's frameID changes, and feed once.
     uint32_t gameFrameID = (uint32_t)rdU64(d, 0x10);
     if (gameFrameID == g_curFrameID) return;   // already fed this game frame
-    bool openedHere = false;
-    if (g_frameTokenReady) {
-        // Native single-token mode: frame_start (UPSCALE) already opened this frame's token so
-        // DLSS-SR + DLSS-G share it. Reuse it; its SimStart was already emitted there.
-        g_frameTokenReady = false;
-        g_curFrameID = gameFrameID;
-    } else {
+    {
         uint32_t idx = gameFrameID ? gameFrameID : ++g_frameIdx;
         sl::FrameToken* t = nullptr;
         if (p_slGetNewFrameToken(t, &idx) != sl::Result::eOk || !t) return;
         g_curToken = t; g_curFrameID = gameFrameID;
-        openedHere = true;
     }
     sl::FrameToken* token = g_curToken;
     g_feedTid = GetCurrentThreadId();
-    // With HW flip metering BLOCKED (nvhook), DLSS-G runs on the SOFTWARE pacer — the same path
-    // that GENERATED (presented=2) on SL 2.2. That pacer needs the full sim/render marker cadence,
-    // so re-add the sim + render-submit-start markers here (matches the 2.2-working config).
+    // The DLSS-G pacer needs the full per-frame sim/render marker cadence.
     // eRenderSubmitEnd is emitted in presentPre just before the real Present.
-    if (openedHere) mark(PCL_SimStart, token);   // in native mode frame_start already emitted SimStart
+    mark(PCL_SimStart,    token);
     mark(PCL_SimEnd,      token);
     mark(PCL_RenderStart, token);
 
@@ -964,19 +914,6 @@ static void feedDLSSG(const void* d)
         // present rate, not the base render rate, so it can only hurt. Let Reflex/the flip queue
         // pace natively. Only the manual dev override (fg_fpscap.txt) still applies, if present.
         g_frameLimitUs = readFpsCapUs();
-        // Steam DLSS-G marker fix (no rebuild): steam_dlss.flag present -> synthesize OOB-present
-        // markers so the Steam overlay recognizes DLSS-G under HW flip metering (which otherwise
-        // emits too few). File content (a number) overrides the per-frame OOB pair count for tuning;
-        // empty file -> use the effective multiplier (numFramesToGenerate+1).
-        { int n = 0;
-          FILE* sf = _wfopen(modPath(L"steam_dlss.flag"), L"rb");
-          if (sf) { char b[16] = {0}; size_t k = fread(b, 1, sizeof(b) - 1, sf); fclose(sf);
-                    int v = k ? atoi(b) : 0;
-                    uint32_t mult = (g_cfg.fgMultiplier > 1) ? (uint32_t)g_cfg.fgMultiplier : 2;
-                    if (g_dlssgMaxGen >= 1 && mult > g_dlssgMaxGen + 1) mult = g_dlssgMaxGen + 1;
-                    n = (v > 0) ? v : (int)mult; }
-          nvhook_set_oob_inject(n);
-        }
     }
 
     // slDLSSGSetOptions is asserted in presentPre() every frame on the PRESENT thread, right before
@@ -1066,14 +1003,12 @@ extern "C" bool slbridge_upscale(const void* d)
     // token as DLSS-G (vp0). g_curToken advances once per real frame in feedDLSSG, so SR still
     // gets a distinct monotonic token each frame (its temporal history stays correct). Fall back
     // to a private token only before DLSS-G has produced its first one.
-    // Diagnostic A/B toggle (no rebuild): sr_separate_token.flag forces the OLD separate SR
-    // token stream (Steam shows "DLSS" label but doubles the native count) so its NvAPI marker
-    // stream can be compared against sharing DLSS-G's token (correct count, "FSR" label).
-    static int s_srTokScan = 0; static bool s_srSeparate = false;
-    if ((s_srTokScan++ % 120) == 0)
-        s_srSeparate = (GetFileAttributesW(modPath(L"sr_separate_token.flag")) != INVALID_FILE_ATTRIBUTES);
+    // Steam-overlay fix (default on): DLSS-SR takes its OWN frame token (a distinct
+    // slGetNewFrameToken stream) so Steam's overlay activates its DLSS-G detector and reports
+    // "DLSS" with the correct native count (paired with proxy.cpp removing Steam's FSR detector).
+    // Off -> share DLSS-G's token (Steam reports "FSR"). Also mint our own if DLSS-G has no token yet.
     sl::FrameToken* t = g_curToken;
-    if (s_srSeparate || !t) {
+    if (g_cfg.steamFix || !t) {
         uint32_t idx = ++g_srFrameIdx;
         if (p_slGetNewFrameToken(t, &idx) != sl::Result::eOk || !t) return false;
     }

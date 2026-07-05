@@ -49,8 +49,33 @@ static void selfDir(wchar_t* out, size_t cch)
     if (slash) slash[1] = 0;
 }
 
+static bool g_logEnabled = false;   // fsr2dlss.ini [Logging] Debug=true; off by default (no log file)
+
+// Minimal INI read (proxy logs before slbridge's full config parser runs). Returns the boolean
+// value of the given key in fsr2dlss.ini, or `def` if the key/file is absent.
+static bool iniBool(const char* wantKey, bool def)
+{
+    wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
+    wcsncat(path, L"fsr2dlss.ini", MAX_PATH - wcslen(path) - 1);
+    FILE* f = _wfopen(path, L"rb"); if (!f) return def;
+    char line[256]; bool val = def;
+    while (fgets(line, sizeof(line), f)) {
+        char* c = strpbrk(line, ";#"); if (c) *c = 0;
+        char* eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0;
+        char* key = line; while (*key == ' ' || *key == '\t') ++key;
+        char* ke = key + strlen(key); while (ke > key && (ke[-1]==' '||ke[-1]=='\t'||ke[-1]=='\r'||ke[-1]=='\n')) *--ke = 0;
+        if (_stricmp(key, wantKey) != 0) continue;
+        char* v = eq + 1; while (*v == ' ' || *v == '\t') ++v;
+        val = (!_strnicmp(v,"true",4) || !_strnicmp(v,"on",2) || !_strnicmp(v,"yes",3) || v[0]=='1');
+    }
+    fclose(f);
+    return val;
+}
+
 static void logRaw(const char* s)
 {
+    if (!g_logEnabled) return;   // logging is opt-in (Debug=true)
     wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
     wcsncat(path, LOG_NAME, MAX_PATH - wcslen(path) - 1);
     FILE* f = _wfopen(path, L"ab");
@@ -219,6 +244,7 @@ static bool ensureSL(const ffxApiHeader* desc)
 static void doInit()
 {
     if (!g_lockInit) { InitializeCriticalSection(&g_loglock); g_lockInit = true; }
+    g_logEnabled = iniBool("Debug", false);   // opt-in file logging (fsr2dlss.ini [Logging] Debug=true)
     wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
     wcsncat(path, REAL_DLL, MAX_PATH - wcslen(path) - 1);
     g_real = LoadLibraryW(path);
@@ -278,13 +304,6 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxA
     }
     if (slReady && t == T_FRAMEGEN_CREATE) {
         void* ctx = slbridge_create_framegen(desc);
-        if (ctx) { if (context) *context = ctx; return 0; }
-    }
-    // Optionally substitute the FSR UPSCALE context (0x00010000) so no real AMD FSR upscaler
-    // session is created (test whether Steam's "FSR" label comes from that live session). Gated
-    // by stub_fsr.flag + DLSS-SR on; the upscale dispatch is intercepted for DLSS regardless.
-    if (slReady && t == 0x00010000u && slbridge_want_stub_upscale()) {
-        void* ctx = slbridge_create_upscale();
         if (ctx) { if (context) *context = ctx; return 0; }
     }
     return r_create ? r_create(context, desc, memCb) : 1;
@@ -358,11 +377,13 @@ __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffx
 static unsigned char g_cfgClean[16];
 static void*         g_cfgAddr  = nullptr;
 static bool          g_cfgSaved = false;
-static bool unhookFlag()
+// SteamOverlayFix (fsr2dlss.ini, default true): remove Steam's ffxConfigure FSR detector so the
+// overlay reports DLSS (paired with slbridge's own-SR-frame-token to activate Steam's DLSS-G detector).
+static bool steamFixOn()
 {
-    wchar_t p[MAX_PATH]; selfDir(p, MAX_PATH);
-    wcsncat(p, L"unhook_fsr.flag", MAX_PATH - wcslen(p) - 1);
-    return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+    static int cached = -1;
+    if (cached < 0) cached = iniBool("SteamOverlayFix", true) ? 1 : 0;
+    return cached != 0;
 }
 static void restoreFfxConfigure()
 {
@@ -378,7 +399,7 @@ static void restoreFfxConfigure()
 }
 static DWORD WINAPI unhookThread(LPVOID)
 {
-    for (;;) { if (unhookFlag()) restoreFfxConfigure(); Sleep(100); }
+    for (;;) { if (steamFixOn()) restoreFfxConfigure(); Sleep(100); }
 }
 static void startUnhookThread()
 {
