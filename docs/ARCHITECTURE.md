@@ -43,7 +43,7 @@ are in UV space and Streamline gets `mvecScale = {1, 1}`.
       amd_fidelityfx_dx12.dll   <- the proxy (this repo)
         |  proxy.cpp routes by type id
         +-- UPSCALE dispatch   -> slbridge_upscale()          DLSS super-resolution
-        +-- FGSWAPCHAIN NEW     -> slbridge_create_swapchain() DLSS-G swapchain (+ overlay init)
+        +-- FGSWAPCHAIN NEW     -> slbridge_create_swapchain() DLSS-G swapchain
         +-- FRAMEGEN PREPARE    -> feedDLSSG()                 depth / MV / constants / markers
         +-- FRAMEGEN dispatch   -> slbridge_dispatch()         HUD-less tags, colorspace
         +-- everything else     -> forward to amd_fidelityfx_dx12.amd.dll
@@ -66,6 +66,12 @@ inline hook on this DLL's `ffxConfigure` export. proxy.cpp saves its own clean `
 at load and runs a small background thread that restores it, removing Steam's hook so the overlay no
 longer treats the game as an FSR title. This is gated by `SteamOverlayFix` in the ini and is on by
 default.
+
+### status.h
+
+`ModStatus g_status`: plain counters and flags written by proxy.cpp (FidelityFX calls and contexts,
+upscale passes, the real DLL), slbridge.cpp (Streamline state, the game's FG toggle, DLSS-G swapchain)
+and dxgihook.cpp (native hooks, captured queue), read by the overlay's status panel.
 
 ### config.cpp
 
@@ -95,17 +101,33 @@ whose `numFramesToGenerate` selects the multiplier and whose `eDynamic` mode is 
   game presents once per rendered frame) and the sum of `DLSSGState::numFramesActuallyPresented` per
   second (the displayed framerate), plus the card's MFG limits and DLSS-G status.
 
+### dxgihook.cpp
+
+Makes the overlay independent of frame generation. From a worker thread started in `DllMain` it
+creates a throwaway D3D12 device, queue and 64x64 swapchain on a hidden window, reads the runtime
+vtables (every DXGI swapchain and D3D12 queue in the process shares them), and MinHooks
+`IDXGISwapChain::Present/Present1/ResizeBuffers/ResizeBuffers1` and
+`ID3D12CommandQueue::ExecuteCommandLists`. The queue hook remembers the last direct queue seen (the
+game's render queue); the Present hooks draw the overlay on the game's own swapchain whenever the
+DLSS-G swapchain is not live, and pass straight through otherwise (Streamline presents the real and
+generated frames through a native swapchain that lands here).
+
 ### overlay.cpp
 
-The in-game overlay, Dear ImGui drawn straight into the DLSS-G swapchain's back buffer from the
-Present hook, on the game's present queue (one command list, three rotating allocators fenced on that
-queue; back-buffer references are released every frame so `ResizeBuffers` is never blocked). The
+The in-game overlay, Dear ImGui drawn straight into the current swapchain's back buffer from a
+Present hook, on the game's direct queue (one command list, three rotating allocators fenced on that
+queue; back-buffer references are released every frame so `ResizeBuffers` is never blocked). It binds
+lazily to whatever swapchain and queue a hook hands it (the DLSS-G one from the bridge, the game's own
+from dxgihook.cpp) and rebinds when they change. Its status panel reads `ModStatus` (`status.h`): what
+the game is calling (FSR contexts, upscale passes per second, the FG toggle), whether the original AMD
+DLL loaded, Streamline's state and which swapchain is hooked. The
 toggle key is polled with `GetAsyncKeyState` so it works regardless of how the game reads input. While
 open, the swapchain window's WndProc is subclassed: keyboard and mouse messages go to ImGui and are
 swallowed (releases pass through so no key sticks), and `SetCursorPos`/`ClipCursor` are hooked so
 the game cannot re-centre or hide the pointer. The DX12 backend in `third_party/imgui_backends` is
 upstream ImGui plus a pixel-shader output transform so the UI is encoded correctly on HDR10 (PQ) and
-scRGB swapchains; the bridge tells it the colour space when it sets `SetColorSpace1`.
+scRGB swapchains; the bridge tells it the colour space when it sets `SetColorSpace1`, and on the game's
+own swapchain it is derived from the back-buffer format and the output's HDR state.
 
 ### nvhook.cpp
 

@@ -64,15 +64,22 @@ your `fsr2dlss.ini` if you have customised it (new keys fall back to defaults).
 
 In the graphics options set Upscaling / Super Resolution to FSR (any preset) and turn Frame
 Generation on. The mod swaps FSR for DLSS underneath and picks the matching DLSS quality mode from the
-preset you chose. The game still shows FSR in its menu; that is expected. The mod's frame-generation
-swapchain (and therefore the overlay) only exists while the game's Frame Generation is on.
+preset you chose. The game still shows FSR in its menu; that is expected. DLSS frame generation only
+runs while the game's Frame Generation is on, because that is when the game hands the mod its swapchain.
 
 ## 5. The overlay (Home key)
 
 Press **Home** in game to open the configuration overlay (the key is `ToggleKey` in `fsr2dlss.ini`).
+It is available from the moment the game window appears, with or without FSR and frame generation on.
 While it is open the mouse and keyboard go to the overlay, not the game. Press Home again or click
 Close to return. Changes apply immediately; **Save to fsr2dlss.ini** writes them to disk for the next
 start.
+
+- **Status** (top of the menu): whether the original AMD DLL was found; whether the game is issuing
+  FSR calls and how often (so you can tell FSR is actually selected in the game); whether the game's
+  frame generation is on and its swapchain was replaced by DLSS-G; Streamline's state; which swapchain
+  the overlay is hooked into (DLSS-G or the game's own); and DLSS-G's status flags if it reports a
+  problem.
 
 - **DLSS Super Resolution**: enable/disable DLSS (off = the game's FSR), the DLSS quality mode (Auto
   follows the in-game FSR preset), and the DLSS model preset (Default, K, J, L, M, or the legacy E/F).
@@ -129,8 +136,11 @@ and read `WIN64\ffx_bridge.log` and `WIN64\streamline\sl.log`.
 - **Driver too old.** `sl.log` says so explicitly; update the NVIDIA driver.
 - **Something that worked with an older fsr2dlss broke.** Set `[Compat] LegacyTagging = true`, which
   restores the old Streamline tagging path, and report what you see.
-- **Overlay does not open.** It only exists while the game's Frame Generation is on. Check
-  `ToggleKey`, and that the game window has focus.
+- **Overlay does not open.** Check `ToggleKey` and that the game window has focus. With `Debug = true`
+  the log shows `[DXGI] native swapchain hooks installed` and `[OVL] bound to swapchain`; if the DXGI
+  hook failed, the overlay still appears once the game's Frame Generation is on.
+- **Status says "no FidelityFX calls yet".** The game is not using FSR: pick FSR as the upscaler in the
+  graphics menu. "FSR context exists but no upscale pass" means FSR is selected but idle (menu/loading).
 
 ## 9. Uninstall
 

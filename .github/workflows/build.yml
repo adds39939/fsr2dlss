@@ -17,7 +17,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MinGW-w64 (MSYS2)
         uses: msys2/setup-msys2@v2
@@ -30,7 +30,7 @@ jobs:
             mingw-w64-x86_64-gcc
 
       - name: Cache third-party downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             deps/streamline-sdk-*.zip
@@ -44,12 +44,12 @@ jobs:
 
       - name: Check exports
         run: |
-          objdump -p build/amd_fidelityfx_dx12.dll | grep -E '^\s+\[\s*[0-9]+\] [A-Za-z_]' | awk '{print $NF}' | sort > exports.txt
+          objdump -p build/amd_fidelityfx_dx12.dll | tr -d '\r' | grep -E '^\s+\[\s*[0-9]+\] [A-Za-z_]' | awk '{print $NF}' | sort > exports.txt
           cat exports.txt
           for e in ffxCreateContext ffxDestroyContext ffxConfigure ffxQuery ffxDispatch; do grep -qx "$e" exports.txt || { echo "missing export $e"; exit 1; }; done
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fsr2dlss
           path: dist/

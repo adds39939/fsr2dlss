@@ -21,6 +21,24 @@ static void NL(const char* fmt, ...)
     bridge_logs(buf);
 }
 
+// MH_Initialize is not thread-safe and three modules (nvhook, overlay, dxgihook) install hooks from
+// different threads, so everyone goes through this guard.
+extern "C" bool mh_ensure_init()
+{
+    static volatile LONG state = 0;   // 0 = not done, 1 = in progress, 2 = ok, 3 = failed
+    if (state == 2) return true;
+    if (state == 3) return false;
+    if (InterlockedCompareExchange(&state, 1, 0) == 0) {
+        MH_STATUS s = MH_Initialize();
+        bool ok = (s == MH_OK || s == MH_ERROR_ALREADY_INITIALIZED);
+        if (!ok) NL("[MH] MH_Initialize failed (%d)", (int)s);
+        InterlockedExchange(&state, ok ? 2 : 3);
+    } else {
+        while (state == 1) Sleep(0);
+    }
+    return state == 2;
+}
+
 static const unsigned int NVAPI_ID_D3D12_SetFlipConfig = 0xF3148C42u;
 
 typedef void* (__cdecl* PFN_nvapi_QueryInterface)(unsigned int id);
@@ -46,10 +64,9 @@ extern "C" bool nvhook_install()
     void* qi = (void*)GetProcAddress(nv, "nvapi_QueryInterface");
     if (!qi) { NL("[NVHOOK] nvapi_QueryInterface export not found"); return false; }
 
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { NL("[NVHOOK] MH_Initialize failed (%d)", (int)s); return false; }
+    if (!mh_ensure_init()) return false;
 
-    s = MH_CreateHook(qi, (void*)&hk_nvapi_QueryInterface, (void**)&o_nvapi_QI);
+    MH_STATUS s = MH_CreateHook(qi, (void*)&hk_nvapi_QueryInterface, (void**)&o_nvapi_QI);
     if (s != MH_OK) { NL("[NVHOOK] MH_CreateHook failed (%d)", (int)s); return false; }
 
     s = MH_EnableHook(qi);

@@ -1,23 +1,26 @@
 // ============================================================================
-// In-game overlay: Dear ImGui rendered straight into the DLSS-G swapchain's
-// back buffer from the Present hook, on the game's own present queue.
+// In-game overlay: Dear ImGui rendered straight into the current swapchain's
+// back buffer from a Present hook, on the game's own direct command queue.
 //
+//  - Always on: fed by slbridge.cpp while the DLSS-G swapchain is live and by
+//    dxgihook.cpp's native Present hook otherwise. Binds lazily to whatever
+//    swapchain/queue arrives and rebinds when they change.
 //  - Toggle: Config::overlayKey (Home), polled with GetAsyncKeyState so it works
 //    no matter how the game reads input (raw input, DirectInput, messages).
 //  - Input: the swapchain window's WndProc is subclassed. While the menu is open
 //    keyboard/mouse messages go to ImGui and are swallowed so the game does not
 //    react; SetCursorPos/ClipCursor are hooked (MinHook) so the game cannot
 //    re-centre or hide the pointer. ImGui draws its own cursor.
-//  - HDR: the bridge tells us the swapchain colour space; the patched DX12
-//    backend applies the matching output transform (see third_party/imgui_backends).
-//  - GPU: one command list, 3 rotating allocators fenced on the present queue.
-//    Back-buffer references are released every frame so ResizeBuffers is never
-//    blocked by us.
+//  - HDR: the bridge tells us the DLSS-G swapchain's colour space; on the native
+//    path it is derived from the back-buffer format and the output's colour
+//    space. The patched DX12 backend applies the matching output transform.
+//  - GPU: one command list, 3 rotating allocators fenced on the queue. Back-buffer
+//    references are released every frame so ResizeBuffers is never blocked by us.
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -30,9 +33,11 @@
 
 #include "config.h"
 #include "slbridge.h"
+#include "status.h"
 #include "overlay.h"
 
 extern "C" void bridge_logs(const char* s);
+extern "C" bool mh_ensure_init();
 static void OL(const char* fmt, ...)
 {
     char buf[512];
@@ -52,9 +57,10 @@ static const UINT kSrvHeapSize    = 64;
 
 struct FrameRes { ID3D12CommandAllocator* alloc = nullptr; UINT64 fenceValue = 0; };
 
-static ID3D12Device*              g_dev        = nullptr;
-static ID3D12CommandQueue*        g_queue      = nullptr;
-static IDXGISwapChain3*           g_sc         = nullptr;   // not AddRef'd; owned by the bridge
+static ID3D12Device*              g_dev        = nullptr;   // AddRef'd
+static ID3D12CommandQueue*        g_queue      = nullptr;   // AddRef'd
+static IDXGISwapChain*            g_sc         = nullptr;   // not AddRef'd; the hook owner keeps it alive
+static bool                       g_slPath     = false;
 static HWND                       g_hwnd       = nullptr;
 static ID3D12GraphicsCommandList* g_cmd        = nullptr;
 static FrameRes                   g_frames[kFramesInFlight];
@@ -68,10 +74,12 @@ static UINT                       g_srvInc     = 0;
 static bool                       g_srvUsed[kSrvHeapSize] = {};
 static DXGI_FORMAT                g_rtvFormat  = DXGI_FORMAT_UNKNOWN;
 static UINT                       g_bbW = 0, g_bbH = 0;
+static bool                       g_gpuReady   = false;
 static bool                       g_imguiReady = false;
 static bool                       g_dx12Ready  = false;
 static bool                       g_failed     = false;    // give up after a hard failure (no spam)
 static int                        g_colorMode  = 0;        // 0 sdr, 1 pq, 2 scrgb
+static bool                       g_colorExplicit = false; // set by the bridge for the DLSS-G swapchain
 static float                      g_appliedScale = 0.0f;
 
 static volatile LONG              g_visible    = 0;
@@ -99,8 +107,7 @@ static BOOL WINAPI hk_ClipCursor(const RECT* r)
 static void installCursorHooks()
 {
     static bool done = false; if (done) return; done = true;
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { OL("[OVL] MH_Initialize failed (%d)", (int)s); return; }
+    if (!mh_ensure_init()) return;
     if (MH_CreateHookApi(L"user32", "SetCursorPos", (void*)&hk_SetCursorPos, (void**)&o_SetCursorPos) == MH_OK) MH_EnableHook((void*)GetProcAddress(GetModuleHandleW(L"user32"), "SetCursorPos"));
     if (MH_CreateHookApi(L"user32", "ClipCursor",   (void*)&hk_ClipCursor,   (void**)&o_ClipCursor)   == MH_OK) MH_EnableHook((void*)GetProcAddress(GetModuleHandleW(L"user32"), "ClipCursor"));
     OL("[OVL] cursor hooks installed (SetCursorPos=%p ClipCursor=%p)", (void*)o_SetCursorPos, (void*)o_ClipCursor);
@@ -129,9 +136,18 @@ static LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return g_wndUnicode ? CallWindowProcW(g_origWndProc, h, msg, wp, lp) : CallWindowProcA(g_origWndProc, h, msg, wp, lp);
 }
 
-static void installWndProc()
+static void uninstallWndProc()
 {
-    if (!g_hwnd || g_origWndProc) return;
+    if (!g_hwnd || !g_origWndProc) return;
+    if (g_wndUnicode) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc); else SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+    g_origWndProc = nullptr;
+}
+static void installWndProc(HWND hwnd)
+{
+    if (hwnd == g_hwnd && g_origWndProc) return;
+    uninstallWndProc();
+    g_hwnd = hwnd;
+    if (!g_hwnd) return;
     g_wndUnicode = IsWindowUnicode(g_hwnd) != FALSE;
     LONG_PTR prev = g_wndUnicode ? SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)&OverlayWndProc)
                                  : SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)&OverlayWndProc);
@@ -182,7 +198,27 @@ static bool createGpuObjects()
     D3D12_DESCRIPTOR_HEAP_DESC sd{}; sd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; sd.NumDescriptors = kSrvHeapSize; sd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_dev->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&g_srvHeap)))) return false;
     g_srvInc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_gpuReady = true;
     return true;
+}
+
+static void shutdownDx12Backend()
+{
+    if (!g_dx12Ready) return;
+    waitGpuIdle();
+    ImGui_ImplDX12_Shutdown();
+    memset(g_srvUsed, 0, sizeof(g_srvUsed));
+    g_dx12Ready = false;
+}
+
+static void releaseGpuObjects()
+{
+    shutdownDx12Backend();
+    waitGpuIdle();
+    for (UINT i = 0; i < kFramesInFlight; ++i) { rel(g_frames[i].alloc); g_frames[i].fenceValue = 0; }
+    rel(g_cmd); rel(g_fence); rel(g_rtvHeap); rel(g_srvHeap);
+    if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
+    g_gpuReady = false; g_frameIdx = 0;
 }
 
 static void applyStyle()
@@ -235,76 +271,96 @@ static bool initImGui(DXGI_FORMAT fmt)
             return false;
         }
         g_rtvFormat = fmt; g_dx12Ready = true;
-        OL("[OVL] ImGui DX12 backend ready (rtv fmt=%u, color mode=%d)", (unsigned)fmt, g_colorMode);
+        OL("[OVL] ImGui DX12 backend ready (rtv fmt=%u, color mode=%d, path=%s)", (unsigned)fmt, g_colorMode, g_slPath ? "streamline" : "native");
     }
     ImGui_ImplDX12_SetOutputTransform(g_colorMode, g_cfg.overlayNits);
     return true;
 }
 
-static void shutdownDx12Backend()
+// Derive the colour space of a swapchain we were not told about (native path): FP16 is scRGB; a
+// 10-bit back buffer is HDR10 PQ when the output it sits on is in HDR mode, otherwise SDR.
+static int deriveColorMode(IDXGISwapChain* sc, DXGI_FORMAT fmt)
 {
-    if (!g_dx12Ready) return;
-    waitGpuIdle();
-    ImGui_ImplDX12_Shutdown();
-    memset(g_srvUsed, 0, sizeof(g_srvUsed));
-    g_dx12Ready = false;
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return 2;
+    if (fmt != DXGI_FORMAT_R10G10B10A2_UNORM) return 0;
+    IDXGIOutput* out = nullptr; int mode = 0;
+    if (SUCCEEDED(sc->GetContainingOutput(&out)) && out) {
+        IDXGIOutput6* o6 = nullptr;
+        if (SUCCEEDED(out->QueryInterface(IID_PPV_ARGS(&o6))) && o6) {
+            DXGI_OUTPUT_DESC1 d{};
+            if (SUCCEEDED(o6->GetDesc1(&d)) && d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) mode = 1;
+            o6->Release();
+        }
+        out->Release();
+    }
+    return mode;
 }
 
-// ---- public API -------------------------------------------------------------------------------------------
-bool overlay_init(ID3D12Device* device, ID3D12CommandQueue* queue, IDXGISwapChain3* sc, void* hwnd)
+// Bind to the swapchain/queue a Present hook handed us; rebuild whatever changed.
+static bool bind(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath, const DXGI_SWAP_CHAIN_DESC1& d)
 {
-    if (g_dev) overlay_shutdown();
-    if (!device || !queue || !sc) return false;
-    if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = true; }
-    g_dev = device; g_dev->AddRef();
-    g_queue = queue; g_queue->AddRef();
-    g_sc = sc;
-    g_hwnd = (HWND)hwnd;
-    if (!g_hwnd) sc->GetHwnd(&g_hwnd);
-    g_failed = false; g_frameIdx = 0;
-    if (!createGpuObjects()) { OL("[OVL] failed to create GPU objects"); g_failed = true; return false; }
-    DXGI_SWAP_CHAIN_DESC1 d{}; if (SUCCEEDED(sc->GetDesc1(&d))) {
-        g_bbW = d.Width; g_bbH = d.Height;
-        if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) g_colorMode = 2;
+    ID3D12Device* dev = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return false;
+    if (dev != g_dev) {
+        releaseGpuObjects();
+        rel(g_dev); g_dev = dev;              // keep the reference GetDevice gave us
+        if (!createGpuObjects()) { OL("[OVL] failed to create GPU objects"); g_failed = true; return false; }
+    } else dev->Release();
+    if (queue != g_queue) {
+        shutdownDx12Backend();                // the backend uploads textures on this queue
+        rel(g_queue); g_queue = queue; g_queue->AddRef();
     }
-    installWndProc();
+    HWND hwnd = nullptr;
+    IDXGISwapChain1* sc1 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) { sc1->GetHwnd(&hwnd); sc1->Release(); }
+    if (!hwnd) { DXGI_SWAP_CHAIN_DESC d0{}; if (SUCCEEDED(sc->GetDesc(&d0))) hwnd = d0.OutputWindow; }
+    if (hwnd != g_hwnd) {
+        if (g_imguiReady) { if (g_csInit) EnterCriticalSection(&g_cs); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false; if (g_csInit) LeaveCriticalSection(&g_cs); shutdownDx12Backend(); }
+        installWndProc(hwnd);
+    }
     installCursorHooks();
-    OL("[OVL] initialised: %ux%u key=%s overlay=%d fps=%d", g_bbW, g_bbH, config_key_name(g_cfg.overlayKey), (int)g_cfg.overlayOn, (int)g_cfg.showFps);
+    g_sc = sc; g_slPath = slPath;
+    if (!g_colorExplicit || !slPath) g_colorMode = deriveColorMode(sc, d.Format);
+    g_status.presentPath = slPath ? PRESENT_STREAMLINE : PRESENT_NATIVE;
+    OL("[OVL] bound to swapchain %p (%s path) %ux%u fmt=%u queue=%p hwnd=%p color=%d", (void*)sc, slPath ? "streamline" : "native", d.Width, d.Height, (unsigned)d.Format, (void*)queue, (void*)hwnd, g_colorMode);
     return true;
 }
 
+// ---- public API -------------------------------------------------------------------------------------------
 void overlay_set_colorspace(int mode)
 {
-    g_colorMode = mode;
+    g_colorMode = mode; g_colorExplicit = true;
     if (g_dx12Ready) ImGui_ImplDX12_SetOutputTransform(g_colorMode, g_cfg.overlayNits);
 }
 
 void overlay_before_resize()
 {
-    if (!g_dev) return;
+    if (!g_gpuReady) return;
     waitGpuIdle();   // our last command list referenced a back buffer; make sure it is done
-    // A format change needs a new pipeline state; sizes are re-read every frame.
     g_bbW = g_bbH = 0;
+}
+
+void overlay_swapchain_destroyed(void* sc)
+{
+    if (sc && sc == (void*)g_sc) {
+        waitGpuIdle();
+        g_sc = nullptr; g_colorExplicit = false;
+        g_status.presentPath = PRESENT_NONE;
+    }
 }
 
 void overlay_shutdown()
 {
-    if (!g_dev) return;
     InterlockedExchange(&g_visible, 0);
     // Unsubclass first so the window thread stops entering ImGui, then destroy the context under the lock.
-    if (g_hwnd && g_origWndProc) {
-        if (g_wndUnicode) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc); else SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
-        g_origWndProc = nullptr;
-    }
+    uninstallWndProc();
     if (g_csInit) EnterCriticalSection(&g_cs);
-    shutdownDx12Backend();
+    releaseGpuObjects();
     if (g_imguiReady) { ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false; }
     if (g_csInit) LeaveCriticalSection(&g_cs);
-    for (UINT i = 0; i < kFramesInFlight; ++i) { rel(g_frames[i].alloc); g_frames[i].fenceValue = 0; }
-    rel(g_cmd); rel(g_fence); rel(g_rtvHeap); rel(g_srvHeap);
-    if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
     rel(g_queue); rel(g_dev); g_sc = nullptr; g_hwnd = nullptr;
     g_rtvFormat = DXGI_FORMAT_UNKNOWN;
+    g_status.presentPath = PRESENT_NONE;
 }
 
 // ---- toggle -------------------------------------------------------------------------------------------------
@@ -324,6 +380,25 @@ static void pollToggleKey()
         if (!now && g_imguiReady) { ImGuiIO& io = ImGui::GetIO(); io.ClearInputKeys(); io.ClearInputMouse(); }
     }
     g_keyWasDown = down;
+}
+
+// ---- rates for the status panel / native-path FPS ------------------------------------------------------------
+static float g_upscaleRate = 0;   // FSR upscale passes per second the game issues
+static void updateRates(bool slPath)
+{
+    static ULONGLONG s_last = 0; static uint32_t s_lastUp = 0; static unsigned s_presents = 0, s_lastPresents = 0;
+    ++s_presents;
+    ULONGLONG now = GetTickCount64();
+    if (!s_last) { s_last = now; s_lastUp = g_status.upscaleDispatches; s_lastPresents = s_presents; return; }
+    ULONGLONG dt = now - s_last;
+    if (dt < 500) return;
+    g_upscaleRate = (g_status.upscaleDispatches - s_lastUp) * 1000.0f / (float)dt;
+    if (!slPath) {
+        // No DLSS-G: the bridge is not counting, so the presents we see are the whole story.
+        float fps = (s_presents - s_lastPresents) * 1000.0f / (float)dt;
+        g_stats.baseFps = fps; g_stats.displayFps = fps; g_stats.fgApplied = 0;
+    }
+    s_last = now; s_lastUp = g_status.upscaleDispatches; s_lastPresents = s_presents;
 }
 
 // ---- UI -----------------------------------------------------------------------------------------------------
@@ -350,30 +425,69 @@ static const char* srModeName(int m)
     switch (m) { case 1: return "Performance"; case 2: return "Balanced"; case 3: return "Quality"; case 4: return "Ultra Performance"; case 5: return "Ultra Quality"; case 6: return "DLAA"; default: return "off"; }
 }
 
+static const ImVec4 kOk(0.5f, 1.0f, 0.6f, 1), kWarn(1.0f, 0.75f, 0.3f, 1), kBad(1.0f, 0.45f, 0.4f, 1), kDim(0.6f, 0.6f, 0.6f, 1);
+static void row(const char* label, const ImVec4& col, const char* fmt, ...)
+{
+    char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    ImGui::TextDisabled("%s", label); ImGui::SameLine(170 * g_cfg.overlayScale); ImGui::TextColored(col, "%s", buf);
+}
+
+static void drawStatus()
+{
+    const ModStatus& st = g_status;
+    const BridgeStats& s = g_stats;
+    bool fsrLive = st.lastUpscaleTick && (GetTickCount64() - st.lastUpscaleTick) < 1000;
+
+    if (st.realDllLoaded) row("Proxy", kOk, "loaded, original amd_fidelityfx_dx12.amd.dll found");
+    else                  row("Proxy", kBad, "original DLL missing: rename the game's amd_fidelityfx_dx12.dll to amd_fidelityfx_dx12.amd.dll");
+
+    if (!st.ffxCalls)           row("Game FSR", kWarn, "no FidelityFX calls yet: set Upscaling to FSR in the game's graphics menu");
+    else if (fsrLive)           row("Game FSR", kOk,   "upscaling active, %.0f passes/s -> %s", g_upscaleRate, s.srActive ? "DLSS Super Resolution" : (g_cfg.dlssSR ? "FSR (DLSS not running yet)" : "FSR (DLSS disabled below)"));
+    else if (st.upscaleContext) row("Game FSR", kWarn, "FSR context exists but no upscale pass this second (menu, loading, or FSR switched off)");
+    else                        row("Game FSR", kWarn, "%u FidelityFX calls, no upscale context yet", st.ffxCalls);
+
+    if (!st.fgContext && !st.fgSwapchainContext) row("Game frame gen", kWarn, "off (the game has not created its frame-generation context)");
+    else row("Game frame gen", st.gameFgEnabled ? kOk : kWarn, "%s, FSR frame-gen swapchain %s", st.gameFgEnabled ? "on" : "off (toggle)", st.fgSwapchainContext ? "replaced by DLSS-G" : "not created");
+
+    switch (st.slState) {
+        case SL_READY:  row("Streamline", kOk,   "ready, %u.%u.%u, %s tagging", s.slVersion[0], s.slVersion[1], s.slVersion[2], s.frameTagging ? "frame-based" : "legacy"); break;
+        case SL_FAILED: row("Streamline", kBad,  "FAILED to initialise, see streamline\\sl.log and ffx_bridge.log"); break;
+        case SL_TRYING: row("Streamline", kWarn, "initialising"); break;
+        default:        row("Streamline", kWarn, "not started (starts with the game's first FSR context)"); break;
+    }
+
+    if (st.presentPath == PRESENT_STREAMLINE)      row("Swapchain", kOk,   "DLSS-G swapchain hooked (Streamline presents real + generated frames)");
+    else if (st.presentPath == PRESENT_NATIVE)      row("Swapchain", st.slSwapchainLive ? kWarn : kOk, "game's own swapchain hooked (no frame generation on this path)");
+    else                                            row("Swapchain", kWarn, "nothing hooked yet");
+    if (st.dxgiHookFailed) row("DXGI hook", kBad, "native Present hook failed (overlay only available with frame generation on)");
+
+    if (s.fgStatus) row("DLSS-G status", kWarn, "0x%x:%s%s%s%s%s", s.fgStatus,
+        (s.fgStatus & 1) ? " resolution-too-low" : "", (s.fgStatus & 2) ? " reflex-missing" : "",
+        (s.fgStatus & 4) ? " hdr-format" : "", (s.fgStatus & 8) ? " constants-invalid" : "", (s.fgStatus & 16) ? " backbuffer-index" : "");
+    if (g_cfg.steamFix) row("Steam overlay", kDim, "FSR detector removed %u time(s)", st.steamUnhooks);
+}
+
 static void drawMenu()
 {
     const BridgeStats& s = g_stats;
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(560 * g_cfg.overlayScale, 0), ImGuiCond_FirstUseEver);
-    char title[96]; snprintf(title, sizeof(title), "fsr2dlss  -  DLSS %s / Streamline %u.%u.%u###fsr2dlss", s.srActive ? "SR + FG" : "FG", s.slVersion[0], s.slVersion[1], s.slVersion[2]);
-    if (!ImGui::Begin(title, nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) { ImGui::End(); return; }
+    ImGui::SetNextWindowSize(ImVec2(620 * g_cfg.overlayScale, 0), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("fsr2dlss###fsr2dlss", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) { ImGui::End(); return; }
 
-    // status
     ImGui::TextDisabled("Press %s to close. Changes apply immediately; Save writes fsr2dlss.ini.", config_key_name(g_cfg.overlayKey));
     ImGui::Separator();
-    ImGui::Text("Framerate: %.0f fps displayed, %.0f fps rendered", s.displayFps, s.baseFps);
-    if (s.fgApplied >= 2)      ImGui::Text("Frame generation: %ux (max %ux on this card)", s.fgApplied, s.fgMaxGen + 1);
-    else if (s.fgApplied == 1) ImGui::Text("Frame generation: dynamic (max %ux on this card)", s.fgMaxGen + 1);
-    else                       ImGui::Text("Frame generation: off%s", s.fgGameEnabled ? "" : " (turn Frame Generation on in the game's graphics menu)");
-    if (s.fgStatus) {
-        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "DLSS-G status 0x%x:%s%s%s%s%s", s.fgStatus,
-            (s.fgStatus & 1) ? " resolution-too-low" : "", (s.fgStatus & 2) ? " reflex-missing" : "",
-            (s.fgStatus & 4) ? " hdr-format" : "", (s.fgStatus & 8) ? " constants-invalid" : "", (s.fgStatus & 16) ? " backbuffer-index" : "");
+
+    if (ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen)) {
+        drawStatus();
+        ImGui::Spacing();
+        ImGui::Text("Framerate: %.0f fps displayed, %.0f fps rendered", s.displayFps, s.baseFps);
+        if (s.fgApplied >= 2)      ImGui::Text("Frame generation: %ux (max %ux on this card)", s.fgApplied, s.fgMaxGen + 1);
+        else if (s.fgApplied == 1) ImGui::Text("Frame generation: dynamic (max %ux on this card)", s.fgMaxGen + 1);
+        else                       ImGui::Text("Frame generation: off");
+        if (s.srMode >= 0) ImGui::Text("Super resolution: DLSS %s, preset %s, %ux%u -> %ux%u", srModeName(s.srMode), config_sr_preset_name(s.srPreset), s.renderW, s.renderH, s.outW, s.outH);
+        else               ImGui::Text("Super resolution: %s", g_cfg.dlssSR ? "DLSS not running (waiting for the game's upscale pass)" : "FSR (DLSS disabled)");
     }
-    if (s.srMode >= 0) ImGui::Text("Super resolution: DLSS %s, preset %s, %ux%u -> %ux%u", srModeName(s.srMode), config_sr_preset_name(s.srPreset), s.renderW, s.renderH, s.outW, s.outH);
-    else               ImGui::Text("Super resolution: %s", g_cfg.dlssSR ? "waiting for the game's upscale pass" : "FSR (DLSS disabled)");
-    ImGui::Separator();
 
     // DLSS SR
     if (ImGui::CollapsingHeader("DLSS Super Resolution", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -392,6 +506,7 @@ static void drawMenu()
 
     // FG
     if (ImGui::CollapsingHeader("DLSS Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (!g_status.gameFgEnabled) ImGui::TextColored(kWarn, "Turn Frame Generation on in the game's graphics menu for these to take effect.");
         static const char* fgNames[FG_MODE_COUNT] = { "Off (present real frames only)", "Fixed multiplier", "Dynamic Multi Frame Generation" };
         int mode = g_cfg.fgMode;
         if (comboInt("Preset", &mode, fgNames, FG_MODE_COUNT,
@@ -404,7 +519,7 @@ static void drawMenu()
         ImGui::BeginDisabled(g_cfg.fgMode != FG_FIXED);
         int mult = g_cfg.fgMultiplier;
         if (ImGui::SliderInt("Multiplier", &mult, 2, 4, "%dx")) { g_cfg.fgMultiplier = mult; changed(); }
-        if (mult > maxMult) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "This card reports %dx as its maximum; %dx will be clamped.", maxMult, mult);
+        if (mult > maxMult) ImGui::TextColored(kWarn, "This card reports %dx as its maximum; %dx will be clamped.", maxMult, mult);
         ImGui::EndDisabled();
         ImGui::BeginDisabled(g_cfg.fgMode != FG_DYNAMIC);
         float tfps = g_cfg.fgDynamicFps;
@@ -426,6 +541,7 @@ static void drawMenu()
             if (ImGui::SliderFloat("HDR brightness (nits)", &nits, 50.0f, 1000.0f, "%.0f")) { g_cfg.overlayNits = nits; ImGui_ImplDX12_SetOutputTransform(g_colorMode, nits); changed(); }
         }
         if (ImGui::Checkbox("Steam overlay reports DLSS", &g_cfg.steamFix)) changed();
+        if (ImGui::Checkbox("Write ffx_bridge.log (Debug)", &g_cfg.debug)) changed();
         ImGui::TextDisabled("Toggle key: %s (change ToggleKey in fsr2dlss.ini)", config_key_name(g_cfg.overlayKey));
     }
 
@@ -433,14 +549,15 @@ static void drawMenu()
     if (ImGui::Button("Save to fsr2dlss.ini", ImVec2(200 * g_cfg.overlayScale, 0))) { g_saveOk = config_save(); g_saveTried = true; g_saveMsgUntil = GetTickCount64() + 3000; }
     ImGui::SameLine();
     if (ImGui::Button("Close", ImVec2(120 * g_cfg.overlayScale, 0))) InterlockedExchange(&g_visible, 0);
-    if (g_saveTried && GetTickCount64() < g_saveMsgUntil) { ImGui::SameLine(); if (g_saveOk) ImGui::TextColored(ImVec4(0.5f, 1, 0.6f, 1), "Saved."); else ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "Save failed (see ffx_bridge.log)."); }
-    ImGui::TextDisabled("Flip metering and LegacyTagging apply at the next game start.");
+    if (g_saveTried && GetTickCount64() < g_saveMsgUntil) { ImGui::SameLine(); if (g_saveOk) ImGui::TextColored(kOk, "Saved."); else ImGui::TextColored(kBad, "Save failed (see ffx_bridge.log)."); }
+    ImGui::TextDisabled("Flip metering, Debug and LegacyTagging apply at the next game start.");
     ImGui::End();
 }
 
 static void drawFps()
 {
     const BridgeStats& s = g_stats;
+    const ModStatus& st = g_status;
     ImGuiIO& io = ImGui::GetIO();
     const float pad = 10.0f * g_cfg.overlayScale;
     int c = g_cfg.fpsCorner;
@@ -456,30 +573,40 @@ static void drawFps()
             ImGui::SameLine(); ImGui::TextDisabled("|");
             ImGui::SameLine(); ImGui::Text("base %.0f", s.baseFps);
             ImGui::SameLine(); ImGui::TextDisabled("|");
-            if (s.fgApplied >= 2) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 1, 0.6f, 1), "%ux", s.fgApplied); }
-            else                  { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 1, 0.6f, 1), "dyn %.1fx", s.baseFps > 0 ? s.displayFps / s.baseFps : 0.0f); }
+            if (s.fgApplied >= 2) { ImGui::SameLine(); ImGui::TextColored(kOk, "%ux", s.fgApplied); }
+            else                  { ImGui::SameLine(); ImGui::TextColored(kOk, "dyn %.1fx", s.baseFps > 0 ? s.displayFps / s.baseFps : 0.0f); }
         } else {
             ImGui::Text("%.0f fps", s.baseFps);
             ImGui::SameLine(); ImGui::TextDisabled("|  FG off");
         }
-        if (s.srMode >= 0) { ImGui::SameLine(); ImGui::TextDisabled("|  DLSS %s", srModeName(s.srMode)); }
+        bool fsrLive = st.lastUpscaleTick && (GetTickCount64() - st.lastUpscaleTick) < 1000;
+        if (s.srMode >= 0 && fsrLive) { ImGui::SameLine(); ImGui::TextDisabled("|  DLSS %s", srModeName(s.srMode)); }
+        else if (!fsrLive)            { ImGui::SameLine(); ImGui::TextDisabled("|  no FSR"); }
     }
     ImGui::End();
 }
 
 // ---- per-frame render ---------------------------------------------------------------------------------------
-void overlay_render(IDXGISwapChain3* sc)
+void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
 {
-    if (!g_dev || g_failed || !sc) return;
+    if (g_failed || !sc || !queue) return;
+    if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = true; }
+
+    // Back-buffer description (size/format can change under us on ResizeBuffers).
+    IDXGISwapChain1* sc1 = nullptr;
+    DXGI_SWAP_CHAIN_DESC1 d{};
+    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) || !sc1) return;
+    HRESULT dh = sc1->GetDesc1(&d); sc1->Release();
+    if (FAILED(dh) || !d.Width || !d.Height) return;
+
+    if (sc != g_sc || queue != g_queue || slPath != g_slPath) { if (!bind(sc, queue, slPath, d)) return; }
+    updateRates(slPath);
     pollToggleKey();
     bool visible = g_visible != 0;
     if (!visible && !g_cfg.showFps) return;
 
-    // Back-buffer description (size/format can change under us on ResizeBuffers).
-    DXGI_SWAP_CHAIN_DESC1 d{};
-    if (FAILED(sc->GetDesc1(&d)) || !d.Width || !d.Height) return;
     g_bbW = d.Width; g_bbH = d.Height;
-    if (g_dx12Ready && d.Format != g_rtvFormat) { OL("[OVL] back-buffer format changed %u -> %u, recreating backend", (unsigned)g_rtvFormat, (unsigned)d.Format); shutdownDx12Backend(); }
+    if (g_dx12Ready && d.Format != g_rtvFormat) { OL("[OVL] back-buffer format changed %u -> %u, recreating backend", (unsigned)g_rtvFormat, (unsigned)d.Format); shutdownDx12Backend(); if (!slPath) g_colorMode = deriveColorMode(sc, d.Format); }
     if (!initImGui(d.Format)) { g_failed = true; return; }
     if (g_appliedScale != g_cfg.overlayScale) applyStyle();
 
@@ -491,7 +618,9 @@ void overlay_render(IDXGISwapChain3* sc)
     }
 
     ID3D12Resource* bb = nullptr;
-    UINT bbIndex = sc->GetCurrentBackBufferIndex();
+    UINT bbIndex = 0;
+    IDXGISwapChain3* sc3 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) { bbIndex = sc3->GetCurrentBackBufferIndex(); sc3->Release(); }
     if (FAILED(sc->GetBuffer(bbIndex, IID_PPV_ARGS(&bb))) || !bb) return;
 
     if (FAILED(fr.alloc->Reset()) || FAILED(g_cmd->Reset(fr.alloc, nullptr))) { bb->Release(); return; }
@@ -508,7 +637,7 @@ void overlay_render(IDXGISwapChain3* sc)
     ID3D12DescriptorHeap* heaps[] = { g_srvHeap };
     g_cmd->SetDescriptorHeaps(1, heaps);
 
-    if (g_csInit) EnterCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs);
     ImGuiIO& io = ImGui::GetIO();
     if (visible) io.ConfigFlags &= ~(ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoKeyboard);
     else         io.ConfigFlags |=  (ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoKeyboard);
@@ -524,7 +653,7 @@ void overlay_render(IDXGISwapChain3* sc)
     if (visible) drawMenu();
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_cmd);
-    if (g_csInit) LeaveCriticalSection(&g_cs);
+    LeaveCriticalSection(&g_cs);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_cmd->ResourceBarrier(1, &b);

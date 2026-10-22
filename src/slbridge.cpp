@@ -28,6 +28,7 @@
 #include "sl_helpers.h"
 #include "slbridge.h"
 #include "config.h"
+#include "status.h"
 #include "overlay.h"
 
 extern "C" void bridge_logs(const char* s);
@@ -108,6 +109,11 @@ static FfxResourceLite g_hudless = {};   // from FRAMEGEN configure 0x00020002
 struct BridgeCtx;                        // fwd
 static BridgeCtx* g_scCtx = nullptr;     // the active SL swapchain context
 static ID3D12CommandQueue* g_queue = nullptr; // the game's present queue (from NEW_DX12)
+
+// True while the DLSS-G swapchain is live: the game presents through Streamline's proxy (hooked in
+// place below, where the overlay is drawn) and Streamline presents through a native swapchain that the
+// global DXGI hook must leave alone.
+extern "C" bool slbridge_owns_present() { return g_scCtx != nullptr; }
 static bool     g_fgEnabled = false;     // the game's FG toggle (FRAMEGEN configure)
 static uint64_t g_frameID   = 0;
 static unsigned g_frameCount = 0;
@@ -486,7 +492,7 @@ static void presentPost()
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT f)
 {
     if (f & DXGI_PRESENT_TEST) return g_origPresent(This, s, f);   // occlusion probe, not a frame
-    overlay_render((IDXGISwapChain3*)This);   // overlay is render-submit work: before the markers
+    overlay_render(This, g_queue, true);      // overlay is render-submit work: before the markers
     presentPre();
     HRESULT hr = g_origPresent(This, s, f);
     presentPost();
@@ -495,7 +501,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* This, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p)
 {
     if (f & DXGI_PRESENT_TEST) return g_origPresent1(This, s, f, p);
-    overlay_render((IDXGISwapChain3*)This);
+    overlay_render(This, g_queue, true);
     presentPre();
     HRESULT hr = g_origPresent1(This, s, f, p);
     presentPost();
@@ -651,6 +657,7 @@ extern "C" void* slbridge_create_swapchain(void* oldDescV, void* factoryV, void*
     registerCtx(c);
     g_scCtx = c;
     g_queue = queue;
+    g_status.slSwapchainLive = true;
     L("[SC] substituted SL swapchain sc4=%p (handed to game, Present hooked in place) ctx=%p", (void*)sc4, (void*)c);
 
     // Leave DLSS-G OFF initially (passthrough); the present hook turns it on once the game enables FG.
@@ -658,8 +665,7 @@ extern "C" void* slbridge_create_swapchain(void* oldDescV, void* factoryV, void*
     queryDlssgState();
     L("[SC] DLSS-G caps: numFramesToGenerateMax=%u (up to %ux) dynamicMFG=%d status=0x%x", g_dlssgMaxGen, g_dlssgMaxGen + 1, (int)g_dlssgDynamicOk, g_dlssgStatus);
 
-    // In-game overlay on the game's present queue and this swapchain.
-    if (g_cfg.overlayOn || g_cfg.showFps) overlay_init(g_device, queue, sc4, (void*)od->OutputWindow);
+    // The overlay binds itself to this swapchain on the first hooked Present.
     return c;
 }
 
@@ -955,6 +961,7 @@ extern "C" uint32_t slbridge_configure(void* handle, const void* descV)
         g_hudless.state  = rdU32(descV, 0x68);
         g_frameID        = rdU64(descV, 0x88);
         g_stats.fgGameEnabled = g_fgEnabled;
+        g_status.gameFgEnabled = g_fgEnabled;
         if (wasEnabled && !g_fgEnabled) {
             // PREPARE stops while FG is off, so the token would go stale (the interposer recycles its
             // 6-slot ring); drop it and re-acquire on the next PREPARE.
@@ -1056,10 +1063,9 @@ extern "C" void slbridge_destroy(void* handle)
     if (!c || c->magic != CTX_MAGIC) return;
     L("[BR] destroy ctx=%p kind=%d", (void*)c, (int)c->kind);
     unregisterCtx(c);
-    if (c->kind == CTX_SWAPCHAIN && g_scCtx == c) {
-        // Only the live swapchain owns the overlay; a replaced (older) swapchain must not tear it down.
-        overlay_shutdown();
-        g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF;
+    if (c->kind == CTX_SWAPCHAIN) {
+        overlay_swapchain_destroyed(c->sc4);   // the overlay rebinds to whatever presents next
+        if (g_scCtx == c) { g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF; g_status.slSwapchainLive = false; }
     }
     if (c->dummyList)  c->dummyList->Release();
     if (c->dummyAlloc) c->dummyAlloc->Release();
