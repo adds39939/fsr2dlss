@@ -113,13 +113,11 @@ static char* trimStr(char* s)
 static bool cfgBool(const char* v) { return !_stricmp(v,"true")||!strcmp(v,"1")||!_stricmp(v,"on")||!_stricmp(v,"yes"); }
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-void config_load()
+static volatile LONG g_loadState = 0;   // 0 = not loaded, 1 = loading, 2 = loaded
+
+static void parseInto(Config& c, FILE* f)
 {
-    if (g_cfg.loaded) return;
-    g_cfg.loaded = true;
-    wchar_t path[MAX_PATH]; config_mod_path(L"fsr2dlss.ini", path, MAX_PATH);
-    FILE* f = _wfopen(path, L"rb");
-    if (!f) { CL("[CFG] no fsr2dlss.ini next to the mod; using defaults"); return; }
+    Config& g_cfg = c;   // the key handlers below write into the local copy
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         char* c = strpbrk(line, ";#"); if (c) *c = 0;
@@ -146,7 +144,21 @@ void config_load()
         else if (!strcmp(key,"debug"))            g_cfg.debug = cfgBool(val);
         else if (!strcmp(key,"legacytagging"))    g_cfg.legacyTagging = cfgBool(val);
     }
-    fclose(f);
+}
+
+void config_load()
+{
+    if (g_loadState == 2) return;
+    if (InterlockedCompareExchange(&g_loadState, 1, 0) != 0) { while (g_loadState != 2) Sleep(0); return; }
+    // Parse into a copy and publish it whole, so a concurrent reader never sees a half-applied file.
+    Config c;
+    wchar_t path[MAX_PATH]; config_mod_path(L"fsr2dlss.ini", path, MAX_PATH);
+    FILE* f = _wfopen(path, L"rb");
+    if (f) { parseInto(c, f); fclose(f); }
+    c.loaded = true;
+    g_cfg = c;
+    InterlockedExchange(&g_loadState, 2);
+    if (!f) { CL("[CFG] no fsr2dlss.ini next to the mod; using defaults"); return; }
     CL("[CFG] fsr2dlss.ini: fgMode=%s multiplier=%dx dynFps=%.0f flipMetering=%d dlss=%d quality=%s preset=%s steamFix=%d overlay=%d key=%s showFps=%d hudlessTags=%d legacyTagging=%d",
        config_fg_mode_name(g_cfg.fgMode), g_cfg.fgMultiplier, g_cfg.fgDynamicFps, g_cfg.flipMode, (int)g_cfg.dlssSR,
        config_sr_quality_name(g_cfg.srQuality), config_sr_preset_name(g_cfg.srPreset), (int)g_cfg.steamFix,

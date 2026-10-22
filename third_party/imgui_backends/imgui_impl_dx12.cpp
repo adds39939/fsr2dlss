@@ -84,6 +84,14 @@ typedef decltype(D3D12SerializeRootSignature) *_PFN_D3D12_SERIALIZE_ROOT_SIGNATU
 // 2 = scRGB linear (R16G16B16A16_FLOAT, 1.0 == 80 nits). paperWhiteNits is the luminance of UI white.
 static int   g_ImGui_ImplDX12_OutputMode = 0;
 static float g_ImGui_ImplDX12_PaperWhite = 200.0f;
+static char  g_ImGui_ImplDX12_LastError[1024] = "";
+const char* ImGui_ImplDX12_GetLastError() { return g_ImGui_ImplDX12_LastError; }
+static void ImGui_ImplDX12_SetLastError(const char* stage, ID3DBlob* err)
+{
+    const char* msg = (err && err->GetBufferSize()) ? (const char*)err->GetBufferPointer() : "(no compiler output)";
+    snprintf(g_ImGui_ImplDX12_LastError, sizeof(g_ImGui_ImplDX12_LastError), "%s: %s", stage, msg);
+    if (err) err->Release();
+}
 void ImGui_ImplDX12_SetOutputTransform(int mode, float paperWhiteNits)
 {
     g_ImGui_ImplDX12_OutputMode = mode;
@@ -757,8 +765,13 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
               return output;\
             }";
 
-        if (FAILED(D3DCompile(vertexShader, strlen(vertexShader), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vertexShaderBlob, nullptr)))
-            return false; // NB: Pass ID3DBlob* pErrorBlob to D3DCompile() to get error showing in (const char*)pErrorBlob->GetBufferPointer(). Make sure to Release() the blob!
+        ID3DBlob* vsErr = nullptr;
+        if (FAILED(D3DCompile(vertexShader, strlen(vertexShader), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vertexShaderBlob, &vsErr)))
+        {
+            ImGui_ImplDX12_SetLastError("vertex shader", vsErr);
+            return false;
+        }
+        if (vsErr) vsErr->Release(); // NB: Pass ID3DBlob* pErrorBlob to D3DCompile() to get error showing in (const char*)pErrorBlob->GetBufferPointer(). Make sure to Release() the blob!
         psoDesc.VS = { vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize() };
 
         // Create the input layout
@@ -818,11 +831,14 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
               return out_col; \
             }";
 
-        if (FAILED(D3DCompile(pixelShader, strlen(pixelShader), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &pixelShaderBlob, nullptr)))
+        ID3DBlob* psErr = nullptr;
+        if (FAILED(D3DCompile(pixelShader, strlen(pixelShader), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &pixelShaderBlob, &psErr)))
         {
+            ImGui_ImplDX12_SetLastError("pixel shader", psErr);
             vertexShaderBlob->Release();
             return false; // NB: Pass ID3DBlob* pErrorBlob to D3DCompile() to get error showing in (const char*)pErrorBlob->GetBufferPointer(). Make sure to Release() the blob!
         }
+        if (psErr) psErr->Release();
         psoDesc.PS = { pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize() };
     }
 

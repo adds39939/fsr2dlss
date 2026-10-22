@@ -65,6 +65,8 @@ IMGUI_IMPL_API void     ImGui_ImplDX12_InvalidateDeviceObjects();
 
 // [fsr2dlss] Select the pixel-shader output transform: 0 = SDR passthrough, 1 = HDR10 PQ, 2 = scRGB linear.
 IMGUI_IMPL_API void     ImGui_ImplDX12_SetOutputTransform(int mode, float paperWhiteNits);
+// [fsr2dlss] Text of the last shader compile error (empty if none).
+IMGUI_IMPL_API const char* ImGui_ImplDX12_GetLastError();
 
 // (Advanced) Use e.g. if you need to precisely control the timing of texture updates (e.g. for staged rendering), by setting ImDrawData::Textures = nullptr to handle this manually.
 IMGUI_IMPL_API void     ImGui_ImplDX12_UpdateTexture(ImTextureData* tex);

@@ -116,7 +116,6 @@ static uint32_t g_maxPresented   = 0;         // max numFramesActuallyPresented 
 static uint32_t g_doubledFrames  = 0;         // # frames where presented >= 2
 static int      g_lastAppliedMode = -1;       // last DLSSGMode applied (-1 = never)
 static uint32_t g_lastAppliedGen  = 0;        // last numFramesToGenerate applied
-static uint32_t g_frameIdx       = 0;         // monotonic SL frame index (one token per frame)
 static uint32_t g_curFrameID     = 0xFFFFFFFF; // game's frameID for the current SL token
 static unsigned g_presentCount   = 0;         // presents seen (warmup gate for the Reflex sleep)
 static const unsigned WARMUP_PRESENTS = 120;  // skip the throttling sleep during fragile SL/swapchain init
@@ -444,9 +443,9 @@ static void presentPre()
 {
     g_presentTid = GetCurrentThreadId();
     if (!g_hookLive) { g_hookLive = true; L("[PRESENT] FIRST hooked present -> live (tid=%lu)", g_presentTid); }
-    if (!g_curToken) return;
     // Re-assert DLSS-G options every frame on the present thread, right before Present. Streamline
     // requires the options be set on the presenting thread so it can bind them to the right Present.
+    // This runs even without a token so DLSS-G is told eOff when the game turns FG off.
     {
         uint32_t numGen = 1;
         sl::DLSSGMode mode = wantedFgMode(numGen);
@@ -457,6 +456,7 @@ static void presentPre()
         }
         g_stats.fgApplied = (mode == sl::DLSSGMode::eOff) ? 0 : (mode == sl::DLSSGMode::eDynamic ? 1 : numGen + 1);
     }
+    if (!g_curToken) return;
     // Reflex options before Present. useMarkersToOptimize stays false: this game is single-threaded
     // and emits no genuine sim/submit markers, so letting Reflex optimize off them corrupts the pacer
     // and drops the generated frame.
@@ -485,6 +485,7 @@ static void presentPost()
 }
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT f)
 {
+    if (f & DXGI_PRESENT_TEST) return g_origPresent(This, s, f);   // occlusion probe, not a frame
     overlay_render((IDXGISwapChain3*)This);   // overlay is render-submit work: before the markers
     presentPre();
     HRESULT hr = g_origPresent(This, s, f);
@@ -493,6 +494,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT
 }
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* This, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p)
 {
+    if (f & DXGI_PRESENT_TEST) return g_origPresent1(This, s, f, p);
     overlay_render((IDXGISwapChain3*)This);
     presentPre();
     HRESULT hr = g_origPresent1(This, s, f, p);
@@ -711,7 +713,7 @@ static void feedDLSSG(const void* d)
     uint32_t gameFrameID = (uint32_t)rdU64(d, 0x10);
     if (gameFrameID == g_curFrameID) return;   // already fed this game frame
     {
-        uint32_t idx = gameFrameID ? gameFrameID : ++g_frameIdx;
+        uint32_t idx = gameFrameID;   // 0 is a valid index for both the token ring and the tag ring
         sl::FrameToken* t = nullptr;
         if (p_slGetNewFrameToken(t, &idx) != sl::Result::eOk || !t) return;
         g_curToken = t; g_curFrameID = gameFrameID;
@@ -774,7 +776,11 @@ static void feedDLSSG(const void* d)
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated   = sl::Boolean::eFalse;
     c.motionVectorsJittered  = sl::Boolean::eFalse;
-    p_slSetConstants(c, *token, vp);
+    {
+        sl::Result cr = p_slSetConstants(c, *token, vp);
+        static int cErr = 0;
+        if (cr != sl::Result::eOk && cErr < 5) { ++cErr; L("[FGC] slSetConstants(frame %u) -> %d (%s)", gameFrameID, (int)cr, resStr(cr)); }
+    }
 
     // Dev diagnostic toggle (no rebuild): presence of the flag file forces
     // eShowOnlyInterpolatedFrame, which presents ONLY generated frames. If the
@@ -949,6 +955,11 @@ extern "C" uint32_t slbridge_configure(void* handle, const void* descV)
         g_hudless.state  = rdU32(descV, 0x68);
         g_frameID        = rdU64(descV, 0x88);
         g_stats.fgGameEnabled = g_fgEnabled;
+        if (wasEnabled && !g_fgEnabled) {
+            // PREPARE stops while FG is off, so the token would go stale (the interposer recycles its
+            // 6-slot ring); drop it and re-acquire on the next PREPARE.
+            g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF;
+        }
         static int cfgLog = 0;
         if (cfgLog < 3 || wasEnabled != g_fgEnabled) {
             ++cfgLog;
@@ -1045,9 +1056,10 @@ extern "C" void slbridge_destroy(void* handle)
     if (!c || c->magic != CTX_MAGIC) return;
     L("[BR] destroy ctx=%p kind=%d", (void*)c, (int)c->kind);
     unregisterCtx(c);
-    if (c->kind == CTX_SWAPCHAIN) {
+    if (c->kind == CTX_SWAPCHAIN && g_scCtx == c) {
+        // Only the live swapchain owns the overlay; a replaced (older) swapchain must not tear it down.
         overlay_shutdown();
-        if (g_scCtx == c) { g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; }
+        g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF;
     }
     if (c->dummyList)  c->dummyList->Release();
     if (c->dummyAlloc) c->dummyAlloc->Release();

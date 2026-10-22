@@ -88,8 +88,14 @@ typedef BOOL (WINAPI* PFN_SetCursorPos)(int, int);
 typedef BOOL (WINAPI* PFN_ClipCursor)(const RECT*);
 static PFN_SetCursorPos o_SetCursorPos = nullptr;
 static PFN_ClipCursor   o_ClipCursor   = nullptr;
+static RECT g_lastClip{}; static bool g_lastClipValid = false;   // the game's clip, re-applied when the menu closes
 static BOOL WINAPI hk_SetCursorPos(int x, int y) { if (g_visible) return TRUE; return o_SetCursorPos ? o_SetCursorPos(x, y) : FALSE; }
-static BOOL WINAPI hk_ClipCursor(const RECT* r)  { if (g_visible) return TRUE; return o_ClipCursor ? o_ClipCursor(r) : FALSE; }
+static BOOL WINAPI hk_ClipCursor(const RECT* r)
+{
+    if (r) { g_lastClip = *r; g_lastClipValid = true; } else g_lastClipValid = false;
+    if (g_visible) return TRUE;
+    return o_ClipCursor ? o_ClipCursor(r) : FALSE;
+}
 static void installCursorHooks()
 {
     static bool done = false; if (done) return; done = true;
@@ -221,6 +227,13 @@ static bool initImGui(DXGI_FORMAT fmt)
         ii.RTVFormat = fmt; ii.DSVFormat = DXGI_FORMAT_UNKNOWN;
         ii.SrvDescriptorHeap = g_srvHeap; ii.SrvDescriptorAllocFn = srvAlloc; ii.SrvDescriptorFreeFn = srvFree;
         if (!ImGui_ImplDX12_Init(&ii)) { OL("[OVL] ImGui_ImplDX12_Init failed"); return false; }
+        // Compile shaders / build the PSO now: NewFrame() would otherwise do it lazily and only report
+        // failure through an assert that is compiled out, leaving a dead command list every frame.
+        if (!ImGui_ImplDX12_CreateDeviceObjects()) {
+            OL("[OVL] ImGui_ImplDX12_CreateDeviceObjects failed (fmt=%u): %s", (unsigned)fmt, ImGui_ImplDX12_GetLastError());
+            ImGui_ImplDX12_Shutdown();
+            return false;
+        }
         g_rtvFormat = fmt; g_dx12Ready = true;
         OL("[OVL] ImGui DX12 backend ready (rtv fmt=%u, color mode=%d)", (unsigned)fmt, g_colorMode);
     }
@@ -278,12 +291,15 @@ void overlay_shutdown()
 {
     if (!g_dev) return;
     InterlockedExchange(&g_visible, 0);
-    shutdownDx12Backend();
-    if (g_imguiReady) { ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false; }
+    // Unsubclass first so the window thread stops entering ImGui, then destroy the context under the lock.
     if (g_hwnd && g_origWndProc) {
         if (g_wndUnicode) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc); else SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
         g_origWndProc = nullptr;
     }
+    if (g_csInit) EnterCriticalSection(&g_cs);
+    shutdownDx12Backend();
+    if (g_imguiReady) { ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false; }
+    if (g_csInit) LeaveCriticalSection(&g_cs);
     for (UINT i = 0; i < kFramesInFlight; ++i) { rel(g_frames[i].alloc); g_frames[i].fenceValue = 0; }
     rel(g_cmd); rel(g_fence); rel(g_rtvHeap); rel(g_srvHeap);
     if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
@@ -301,6 +317,10 @@ static void pollToggleKey()
         LONG now = g_visible ? 0 : 1;
         InterlockedExchange(&g_visible, now);
         OL("[OVL] overlay %s", now ? "opened" : "closed");
+        // Free the pointer from any clip the game applied before the menu opened, and put the game's
+        // clip back when it closes.
+        if (now) { if (o_ClipCursor) o_ClipCursor(nullptr); else ClipCursor(nullptr); }
+        else if (g_lastClipValid) { if (o_ClipCursor) o_ClipCursor(&g_lastClip); else ClipCursor(&g_lastClip); }
         if (!now && g_imguiReady) { ImGuiIO& io = ImGui::GetIO(); io.ClearInputKeys(); io.ClearInputMouse(); }
     }
     g_keyWasDown = down;
