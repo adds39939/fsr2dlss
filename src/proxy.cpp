@@ -323,6 +323,9 @@ __declspec(dllexport) ffxReturnCode_t ffxConfigure(ffxContext* context, const ff
 {
     ensure();
     ++g_status.ffxCalls;
+    // FRAMEGEN configure (0x00020002) carries the game's frame-generation toggle at +0x38; record it
+    // here so the status panel is right even when the context is AMD's (Streamline not ready).
+    if (peekType(desc) == 0x00020002 && readable(desc, 0x39)) g_status.gameFgEnabled = *((const unsigned char*)desc + 0x38) != 0;
     void* h = derefCtx(context);
     if (slbridge_is_mine(h)) return slbridge_configure(h, desc);
     if (bump(2, peekType(desc)) <= LOG_CAP) {

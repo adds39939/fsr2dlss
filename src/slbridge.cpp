@@ -30,6 +30,7 @@
 #include "config.h"
 #include "status.h"
 #include "overlay.h"
+#include "dxgihook.h"
 
 extern "C" void bridge_logs(const char* s);
 extern "C" bool nvhook_install();             // nvhook.cpp: hooks nvapi_QueryInterface to control flip metering
@@ -113,7 +114,8 @@ static ID3D12CommandQueue* g_queue = nullptr; // the game's present queue (from 
 // True while the DLSS-G swapchain is live: the game presents through Streamline's proxy (hooked in
 // place below, where the overlay is drawn) and Streamline presents through a native swapchain that the
 // global DXGI hook must leave alone.
-extern "C" bool slbridge_owns_present() { return g_scCtx != nullptr; }
+static volatile LONG g_scTearingDown = 0;    // set around the final Release of the DLSS-G swapchain
+extern "C" bool slbridge_owns_present() { return g_scCtx != nullptr || g_scTearingDown != 0; }
 static bool     g_fgEnabled = false;     // the game's FG toggle (FRAMEGEN configure)
 static uint64_t g_frameID   = 0;
 static unsigned g_frameCount = 0;
@@ -254,6 +256,7 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
 {
     if (g_slReady) return true;
     g_device = (ID3D12Device*)deviceV;
+    dxgihook_notify_device(g_device);   // let the native-swapchain probe use the game's own device
     config_load();
     L("[SL] init begin dir=%ls device=%p (SDK headers %d.%d.%d)", slDir, deviceV, SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     L("[CFG] fgMode=%s multiplier=%dx dynFps=%.0f flipMetering=%d dlss=%d quality=%s preset=%s steamFix=%d overlay=%d key=%s showFps=%d hudlessTags=%d legacyTagging=%d",
@@ -1063,15 +1066,17 @@ extern "C" void slbridge_destroy(void* handle)
     if (!c || c->magic != CTX_MAGIC) return;
     L("[BR] destroy ctx=%p kind=%d", (void*)c, (int)c->kind);
     unregisterCtx(c);
-    if (c->kind == CTX_SWAPCHAIN) {
-        overlay_swapchain_destroyed(c->sc4);   // the overlay rebinds to whatever presents next
-        if (g_scCtx == c) { g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF; g_status.slSwapchainLive = false; }
-    }
+    bool live = (c->kind == CTX_SWAPCHAIN && g_scCtx == c);
+    if (c->kind == CTX_SWAPCHAIN) overlay_swapchain_destroyed(c->sc4);   // the overlay rebinds to whatever presents next
+    // Keep the native Present hook passive until Streamline has torn its swapchain down: presents it
+    // issues while releasing must not make the overlay bind to a swapchain/queue that is going away.
+    if (live) { InterlockedExchange(&g_scTearingDown, 1); g_curToken = nullptr; g_curFrameID = 0xFFFFFFFF; }
     if (c->dummyList)  c->dummyList->Release();
     if (c->dummyAlloc) c->dummyAlloc->Release();
     if (c->dummyTex)   c->dummyTex->Release();
     if (c->uiTex)      c->uiTex->Release();
     if (c->sc4)        c->sc4->Release();
+    if (live) { g_scCtx = nullptr; g_csSet = false; g_status.slSwapchainLive = false; InterlockedExchange(&g_scTearingDown, 0); }
     c->magic = 0;
     delete c;
 }

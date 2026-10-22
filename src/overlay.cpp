@@ -34,6 +34,7 @@
 #include "config.h"
 #include "slbridge.h"
 #include "status.h"
+#include "dxgihook.h"
 #include "overlay.h"
 
 extern "C" void bridge_logs(const char* s);
@@ -90,6 +91,7 @@ static CRITICAL_SECTION           g_cs;                    // guards ImGui conte
 static bool                       g_csInit     = false;
 static WNDPROC                    g_origWndProc = nullptr;
 static bool                       g_wndUnicode = true;
+static float overlayNits();   // paper white for the current colour mode (defined with deriveColorMode)
 
 // ---- user32 hooks: keep the game from fighting the overlay cursor ---------------------------------
 typedef BOOL (WINAPI* PFN_SetCursorPos)(int, int);
@@ -273,27 +275,40 @@ static bool initImGui(DXGI_FORMAT fmt)
         g_rtvFormat = fmt; g_dx12Ready = true;
         OL("[OVL] ImGui DX12 backend ready (rtv fmt=%u, color mode=%d, path=%s)", (unsigned)fmt, g_colorMode, g_slPath ? "streamline" : "native");
     }
-    ImGui_ImplDX12_SetOutputTransform(g_colorMode, g_cfg.overlayNits);
+    ImGui_ImplDX12_SetOutputTransform(g_colorMode, overlayNits());
     return true;
 }
 
-// Derive the colour space of a swapchain we were not told about (native path): FP16 is scRGB; a
-// 10-bit back buffer is HDR10 PQ when the output it sits on is in HDR mode, otherwise SDR.
-static int deriveColorMode(IDXGISwapChain* sc, DXGI_FORMAT fmt)
+// Derive the colour space of a swapchain we were not told about (native path). The swapchain cannot
+// be asked, so use what the game last passed to SetColorSpace1 (recorded by dxgihook.cpp); without
+// that, a 10-bit back buffer is SDR (the DXGI default colour space) and FP16 is scRGB. On an SDR
+// output DWM maps scRGB 1.0 to SDR white, so paper white is 80 nits there instead of the configured
+// HDR value.
+static float g_nitsOverride = 0.0f;   // 0 = Config::overlayNits
+static float overlayNits() { return g_nitsOverride > 0 ? g_nitsOverride : g_cfg.overlayNits; }
+static bool outputIsHdr(IDXGISwapChain* sc)
 {
-    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return 2;
-    if (fmt != DXGI_FORMAT_R10G10B10A2_UNORM) return 0;
-    IDXGIOutput* out = nullptr; int mode = 0;
+    IDXGIOutput* out = nullptr; bool hdr = false;
     if (SUCCEEDED(sc->GetContainingOutput(&out)) && out) {
         IDXGIOutput6* o6 = nullptr;
         if (SUCCEEDED(out->QueryInterface(IID_PPV_ARGS(&o6))) && o6) {
             DXGI_OUTPUT_DESC1 d{};
-            if (SUCCEEDED(o6->GetDesc1(&d)) && d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) mode = 1;
+            if (SUCCEEDED(o6->GetDesc1(&d)) && d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) hdr = true;
             o6->Release();
         }
         out->Release();
     }
-    return mode;
+    return hdr;
+}
+static int deriveColorMode(IDXGISwapChain* sc, DXGI_FORMAT fmt)
+{
+    g_nitsOverride = 0.0f;
+    int cs = dxgihook_colorspace(sc);
+    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) return 1;
+    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)    { if (!outputIsHdr(sc)) g_nitsOverride = 80.0f; return 2; }
+    if (cs >= 0) return 0;   // explicitly SDR
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) { if (!outputIsHdr(sc)) g_nitsOverride = 80.0f; return 2; }
+    return 0;
 }
 
 // Bind to the swapchain/queue a Present hook handed us; rebuild whatever changed.
@@ -315,7 +330,13 @@ static bool bind(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath, con
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) { sc1->GetHwnd(&hwnd); sc1->Release(); }
     if (!hwnd) { DXGI_SWAP_CHAIN_DESC d0{}; if (SUCCEEDED(sc->GetDesc(&d0))) hwnd = d0.OutputWindow; }
     if (hwnd != g_hwnd) {
-        if (g_imguiReady) { if (g_csInit) EnterCriticalSection(&g_cs); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false; if (g_csInit) LeaveCriticalSection(&g_cs); shutdownDx12Backend(); }
+        // Renderer backend first (it needs the ImGui context), then the platform backend and context.
+        if (g_imguiReady) {
+            shutdownDx12Backend();
+            if (g_csInit) EnterCriticalSection(&g_cs);
+            ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_imguiReady = false;
+            if (g_csInit) LeaveCriticalSection(&g_cs);
+        }
         installWndProc(hwnd);
     }
     installCursorHooks();
@@ -329,8 +350,8 @@ static bool bind(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath, con
 // ---- public API -------------------------------------------------------------------------------------------
 void overlay_set_colorspace(int mode)
 {
-    g_colorMode = mode; g_colorExplicit = true;
-    if (g_dx12Ready) ImGui_ImplDX12_SetOutputTransform(g_colorMode, g_cfg.overlayNits);
+    g_colorMode = mode; g_colorExplicit = true; g_nitsOverride = 0.0f;
+    if (g_dx12Ready) ImGui_ImplDX12_SetOutputTransform(g_colorMode, overlayNits());
 }
 
 void overlay_before_resize()
@@ -447,7 +468,8 @@ static void drawStatus()
     else                        row("Game FSR", kWarn, "%u FidelityFX calls, no upscale context yet", st.ffxCalls);
 
     if (!st.fgContext && !st.fgSwapchainContext) row("Game frame gen", kWarn, "off (the game has not created its frame-generation context)");
-    else row("Game frame gen", st.gameFgEnabled ? kOk : kWarn, "%s, FSR frame-gen swapchain %s", st.gameFgEnabled ? "on" : "off (toggle)", st.fgSwapchainContext ? "replaced by DLSS-G" : "not created");
+    else row("Game frame gen", st.gameFgEnabled ? kOk : kWarn, "%s, FSR frame-gen swapchain %s", st.gameFgEnabled ? "on" : "off (toggle)",
+             st.slSwapchainLive ? "replaced by DLSS-G" : (st.fgSwapchainContext ? "running on AMD FSR (DLSS-G substitution did not happen)" : "not created"));
 
     switch (st.slState) {
         case SL_READY:  row("Streamline", kOk,   "ready, %u.%u.%u, %s tagging", s.slVersion[0], s.slVersion[1], s.slVersion[2], s.frameTagging ? "frame-based" : "legacy"); break;
@@ -456,7 +478,7 @@ static void drawStatus()
         default:        row("Streamline", kWarn, "not started (starts with the game's first FSR context)"); break;
     }
 
-    if (st.presentPath == PRESENT_STREAMLINE)      row("Swapchain", kOk,   "DLSS-G swapchain hooked (Streamline presents real + generated frames)");
+    if (st.presentPath == PRESENT_STREAMLINE)      row("Swapchain", kOk,   "DLSS-G swapchain hooked%s", s.fgApplied ? " (Streamline presents real + generated frames)" : " (frame generation currently off)");
     else if (st.presentPath == PRESENT_NATIVE)      row("Swapchain", st.slSwapchainLive ? kWarn : kOk, "game's own swapchain hooked (no frame generation on this path)");
     else                                            row("Swapchain", kWarn, "nothing hooked yet");
     if (st.dxgiHookFailed) row("DXGI hook", kBad, "native Present hook failed (overlay only available with frame generation on)");
@@ -538,7 +560,7 @@ static void drawMenu()
         if (ImGui::SliderFloat("UI scale", &sc, 0.5f, 3.0f, "%.2f")) { g_cfg.overlayScale = sc; changed(); }
         if (g_colorMode != 0) {
             float nits = g_cfg.overlayNits;
-            if (ImGui::SliderFloat("HDR brightness (nits)", &nits, 50.0f, 1000.0f, "%.0f")) { g_cfg.overlayNits = nits; ImGui_ImplDX12_SetOutputTransform(g_colorMode, nits); changed(); }
+            if (ImGui::SliderFloat("HDR brightness (nits)", &nits, 50.0f, 1000.0f, "%.0f")) { g_cfg.overlayNits = nits; ImGui_ImplDX12_SetOutputTransform(g_colorMode, overlayNits()); changed(); }
         }
         if (ImGui::Checkbox("Steam overlay reports DLSS", &g_cfg.steamFix)) changed();
         if (ImGui::Checkbox("Write ffx_bridge.log (Debug)", &g_cfg.debug)) changed();
