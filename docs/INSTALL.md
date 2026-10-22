@@ -138,7 +138,9 @@ and read `WIN64\ffx_bridge.log` and `WIN64\streamline\sl.log`.
   restores the old Streamline tagging path, and report what you see.
 - **Overlay does not open.** Check `ToggleKey` and that the game window has focus. With `Debug = true`
   the log shows `[DXGI] native swapchain hooks installed` and `[OVL] bound to swapchain`; if the DXGI
-  hook failed, the overlay still appears once the game's Frame Generation is on.
+  hook failed, the overlay still appears once the game's Frame Generation is on. Games that load the
+  D3D12 Agility SDK through a device factory may not be caught by the native hook either; frame
+  generation on still gives you the overlay.
 - **Status says "no FidelityFX calls yet".** The game is not using FSR: pick FSR as the upscaler in the
   graphics menu. "FSR context exists but no upscale pass" means FSR is selected but idle (menu/loading).
 

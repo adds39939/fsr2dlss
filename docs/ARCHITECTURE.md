@@ -103,14 +103,18 @@ whose `numFramesToGenerate` selects the multiplier and whose `eDynamic` mode is 
 
 ### dxgihook.cpp
 
-Makes the overlay independent of frame generation. From a worker thread started in `DllMain` it
-creates a throwaway D3D12 device, queue and 64x64 swapchain on a hidden window, reads the runtime
-vtables (every DXGI swapchain and D3D12 queue in the process shares them), and MinHooks
-`IDXGISwapChain::Present/Present1/ResizeBuffers/ResizeBuffers1` and
-`ID3D12CommandQueue::ExecuteCommandLists`. The queue hook remembers the last direct queue seen (the
-game's render queue); the Present hooks draw the overlay on the game's own swapchain whenever the
-DLSS-G swapchain is not live, and pass straight through otherwise (Streamline presents the real and
-generated frames through a native swapchain that lands here).
+Makes the overlay independent of frame generation. A worker thread started in `DllMain` hooks
+`D3D12CreateDevice` and waits for the game's device (from that hook or from the FidelityFX backend
+descriptor; after 20 s it falls back to a throwaway device). With that device it creates a probe queue
+and a 64x64 swapchain on a hidden window, reads the runtime vtables (every DXGI swapchain and D3D12
+queue in the process shares them), and MinHooks `IDXGISwapChain::Present/Present1/ResizeBuffers/
+ResizeBuffers1/SetColorSpace1` and `ID3D12CommandQueue::ExecuteCommandLists`. The queue hook keeps,
+per thread and with a reference held, the last direct queue that thread executed on, so the presenting
+thread's own render queue is what the overlay submits to. `SetColorSpace1` is recorded per swapchain
+so the overlay knows the colour space of a swapchain it was not told about. The Present hooks draw
+the overlay on the game's own swapchain whenever the DLSS-G swapchain is not live (or being torn
+down), and pass straight through otherwise (Streamline presents the real and generated frames through
+a native swapchain that lands here).
 
 ### overlay.cpp
 
