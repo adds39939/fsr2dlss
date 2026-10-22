@@ -66,6 +66,7 @@
 #include <d3d12.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
+#include <cstdio>   // [fsr2dlss] snprintf for the shader error text
 #ifdef _MSC_VER
 #pragma comment(lib, "d3dcompiler") // Automatically link with d3dcompiler.lib as we are using D3DCompile() below.
 #endif
