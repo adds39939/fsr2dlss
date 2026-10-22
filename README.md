@@ -30,7 +30,7 @@ runs underneath it.
 
 ## Install
 
-Download the latest zip from the [Releases page](../../releases) and follow
+Download the latest zip from the [Releases page](https://github.com/adds39939/fsr2dlss/releases) and follow
 [docs/INSTALL.md](docs/INSTALL.md) (a copy is in the zip). In short: back up the game's
 `amd_fidelityfx_dx12.dll` and rename it to `amd_fidelityfx_dx12.amd.dll`, copy the proxy into its
 place, drop the `streamline\` folder and `fsr2dlss.ini` next to it, and set the game to FSR + Frame
