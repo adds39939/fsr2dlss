@@ -44,9 +44,17 @@ jobs:
 
       - name: Check exports
         run: |
-          objdump -p build/amd_fidelityfx_dx12.dll | tr -d '\r' | grep -E '^\s+\[\s*[0-9]+\] [A-Za-z_]' | awk '{print $NF}' | sort > exports.txt
+          objdump -p build/amd_fidelityfx_dx12.dll | tr -d '\r' > objdump.txt
+          # Names in the export table, independent of objdump's column layout.
+          grep -oE '\bffx[A-Za-z]+\b' objdump.txt | sort -u > exports.txt
+          echo "::notice title=Exports::$(tr '\n' ' ' < exports.txt)"
+          echo "::notice title=Export table::$(grep -A12 'Ordinal/Name Pointer' objdump.txt | tr '\n' '|' | cut -c1-900)"
           cat exports.txt
-          for e in ffxCreateContext ffxDestroyContext ffxConfigure ffxQuery ffxDispatch; do grep -qx "$e" exports.txt || { echo "missing export $e"; exit 1; }; done
+          ok=1
+          for e in ffxCreateContext ffxDestroyContext ffxConfigure ffxQuery ffxDispatch; do
+            grep -qx "$e" exports.txt || { echo "::error title=Missing export::$e"; ok=0; }
+          done
+          [ "$ok" = 1 ] || { echo "::error title=objdump::$(head -c 900 objdump.txt | tr '\n' '|')"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
