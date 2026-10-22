@@ -19,15 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up MinGW-w64 (MSYS2)
+      - name: Set up MinGW-w64 (MSYS2 UCRT64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             git
             unzip
-            mingw-w64-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gcc
 
       - name: Cache third-party downloads
         uses: actions/cache@v6

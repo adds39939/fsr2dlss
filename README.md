@@ -120,7 +120,7 @@ the license texts are in the zip's `licenses\` folder.
 ## Build
 
 Needs MinGW-w64 GCC (a UCRT build with the d3d12/dxgi headers) and git. Run `src\build.ps1` on
-Windows, or `src/fetch_deps.sh && src/build.sh` from an MSYS2 MINGW64 shell. Both fetch MinHook,
+Windows, or `src/fetch_deps.sh && src/build.sh` from an MSYS2 UCRT64 shell. Both fetch MinHook,
 Dear ImGui and the pinned Streamline SDK into `deps/`, build `amd_fidelityfx_dx12.dll`, and
 assemble the install package in `dist/`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
