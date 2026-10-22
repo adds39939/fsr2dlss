@@ -1,15 +1,15 @@
-# Toolchain and third-party (fetch/build separately; see docs/ARCHITECTURE.md)
+# Toolchain and third-party (fetched by src/fetch_deps.sh / src/build.ps1; see third_party/streamline/README.md)
 /mingw64/
 /sdk/
+/deps/
 /minhook_src/
 /mh_obj/
 /build/
 /dist/
 
-# Build outputs. The bundled Streamline plugins (MIT) under runtime/streamline are the exception.
+# Build outputs. Runtime DLLs (Streamline plugins, DLSS models) are never committed; the release
+# workflow downloads the pinned Streamline SDK and bundles them into the release zip.
 *.dll
-!/runtime/streamline/sl.*.dll
-# NGX models are proprietary NVIDIA binaries; download from TechPowerUp.
 nvngx_*.dll
 *.o
 *.obj
@@ -22,8 +22,11 @@ nvngx_*.dll
 # Logs and dev scratch
 *.log
 fg_fpscap.txt
+fg_interp.flag
+dlss_sr_off.flag
 logsummary.txt
 mdrive.txt
+fsr2dlss.ini.tmp
 
 # Editor / OS
 .vs/

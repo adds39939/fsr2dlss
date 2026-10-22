@@ -15,6 +15,7 @@
 #include <cstdarg>
 #include <cstring>
 #include "slbridge.h"
+#include "config.h"
 
 // ---- minimal, version-stable FfxApi surface (header is ABI-frozen) ---------
 typedef uint32_t ffxReturnCode_t;
@@ -51,28 +52,6 @@ static void selfDir(wchar_t* out, size_t cch)
 }
 
 static bool g_logEnabled = false;   // fsr2dlss.ini [Logging] Debug=true; off by default (no log file)
-
-// Minimal INI read (proxy logs before slbridge's full config parser runs). Returns the boolean
-// value of the given key in fsr2dlss.ini, or `def` if the key/file is absent.
-static bool iniBool(const char* wantKey, bool def)
-{
-    wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
-    wcsncat(path, L"fsr2dlss.ini", MAX_PATH - wcslen(path) - 1);
-    FILE* f = _wfopen(path, L"rb"); if (!f) return def;
-    char line[256]; bool val = def;
-    while (fgets(line, sizeof(line), f)) {
-        char* c = strpbrk(line, ";#"); if (c) *c = 0;
-        char* eq = strchr(line, '='); if (!eq) continue;
-        *eq = 0;
-        char* key = line; while (*key == ' ' || *key == '\t') ++key;
-        char* ke = key + strlen(key); while (ke > key && (ke[-1]==' '||ke[-1]=='\t'||ke[-1]=='\r'||ke[-1]=='\n')) *--ke = 0;
-        if (_stricmp(key, wantKey) != 0) continue;
-        char* v = eq + 1; while (*v == ' ' || *v == '\t') ++v;
-        val = (!_strnicmp(v,"true",4) || !_strnicmp(v,"on",2) || !_strnicmp(v,"yes",3) || v[0]=='1');
-    }
-    fclose(f);
-    return val;
-}
 
 static void logRaw(const char* s)
 {
@@ -245,7 +224,8 @@ static bool ensureSL(const ffxApiHeader* desc)
 static void doInit()
 {
     if (!g_lockInit) { InitializeCriticalSection(&g_loglock); g_lockInit = true; }
-    g_logEnabled = iniBool("Debug", false);   // opt-in file logging (fsr2dlss.ini [Logging] Debug=true)
+    config_load();                      // fsr2dlss.ini (shared with the bridge and the overlay)
+    g_logEnabled = g_cfg.debug;         // opt-in file logging ([Logging] Debug=true)
     wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
     wcsncat(path, REAL_DLL, MAX_PATH - wcslen(path) - 1);
     g_real = LoadLibraryW(path);
@@ -382,9 +362,8 @@ static bool          g_cfgSaved = false;
 // overlay reports DLSS (paired with slbridge's own-SR-frame-token to activate Steam's DLSS-G detector).
 static bool steamFixOn()
 {
-    static int cached = -1;
-    if (cached < 0) cached = iniBool("SteamOverlayFix", true) ? 1 : 0;
-    return cached != 0;
+    config_load();
+    return g_cfg.steamFix;   // live: the overlay can toggle it
 }
 static void restoreFfxConfigure()
 {

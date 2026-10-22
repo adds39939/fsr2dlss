@@ -4,6 +4,9 @@
 // DLSS-G swapchain, runs DLSS super-resolution on the upscale dispatch, feeds
 // DLSS-G depth/motion-vectors/camera each frame, and drives the Reflex/PCL
 // marker loop that paces the generated frames.
+//
+// Built against the Streamline 2.14 SDK headers (third_party/streamline). The
+// runtime plugins and the DLSS models ship with the release package.
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -14,14 +17,18 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
-#include <cctype>
+#include <cmath>
 
 #include "sl.h"
 #include "sl_consts.h"
 #include "sl_dlss.h"
 #include "sl_dlss_g.h"
 #include "sl_reflex.h"
+#include "sl_pcl.h"
+#include "sl_helpers.h"
 #include "slbridge.h"
+#include "config.h"
+#include "overlay.h"
 
 extern "C" void bridge_logs(const char* s);
 extern "C" bool nvhook_install();             // nvhook.cpp: hooks nvapi_QueryInterface to control flip metering
@@ -36,81 +43,16 @@ static void L(const char* fmt, ...)
     buf[n] = '\n'; buf[n + 1] = 0;
     bridge_logs(buf);
 }
+static const char* resStr(sl::Result r) { return sl::getResultAsStr(r); }
 
-// ---- mod directory + fsr2dlss.ini config ------------------------------------
-// All runtime files (fsr2dlss.ini, toggles) live next to this DLL, resolved from the DLL path
-// so there are no hardcoded absolute paths.
-static wchar_t g_modDir[MAX_PATH] = L"";
-static void computeModDir()
-{
-    if (g_modDir[0]) return;
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&computeModDir, &self);
-    wchar_t path[MAX_PATH] = L"";
-    if (self) GetModuleFileNameW(self, path, MAX_PATH);
-    wcsncpy(g_modDir, path, MAX_PATH - 1);
-    wchar_t* slash = wcsrchr(g_modDir, L'\\');
-    if (slash) slash[1] = 0; else g_modDir[0] = 0;
-}
+BridgeStats g_stats;
+
 // Not reentrant; use the returned pointer immediately.
 static const wchar_t* modPath(const wchar_t* name)
 {
     static wchar_t buf[MAX_PATH];
-    computeModDir();
-    _snwprintf(buf, MAX_PATH, L"%s%s", g_modDir, name);
+    config_mod_path(name, buf, MAX_PATH);
     return buf;
-}
-// Current primary-display refresh rate in Hz (for the MFG base frame cap = refresh / multiplier).
-static uint32_t getRefreshHz()
-{
-    DEVMODEW dm; memset(&dm, 0, sizeof(dm)); dm.dmSize = sizeof(dm);
-    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) return dm.dmDisplayFrequency;
-    return 0;
-}
-
-struct Config {
-    int  fgMultiplier = 2;      // frame-gen multiplier: 2, 3, or 4 (clamped to the card's max)
-    int  flipMode     = 0;      // 0 = software pacer (block SetFlipConfig), 1 = hardware flip metering, 2 = auto
-    bool dlssSR       = true;   // false = pass the upscale through to the game's FSR
-    bool hudlessTags  = false;  // experimental HUDLessColor / UI tagging for DLSS-G
-    bool steamFix     = true;   // DLSS-SR takes its own frame token so the Steam overlay reports "DLSS"
-    bool loaded       = false;
-};
-static Config g_cfg;
-
-static char* trimStr(char* s)
-{
-    while (*s==' '||*s=='\t'||*s=='\r'||*s=='\n') ++s;
-    char* e = s + strlen(s);
-    while (e > s && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) *--e = 0;
-    return s;
-}
-static bool cfgBool(const char* v) { return !_stricmp(v,"true")||!strcmp(v,"1")||!_stricmp(v,"on")||!_stricmp(v,"yes"); }
-
-static void loadConfig()
-{
-    if (g_cfg.loaded) return;
-    g_cfg.loaded = true;
-    FILE* f = _wfopen(modPath(L"fsr2dlss.ini"), L"rb");
-    if (!f) { L("[CFG] no fsr2dlss.ini next to the mod; using defaults"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char* c = strpbrk(line, ";#"); if (c) *c = 0;
-        char* eq = strchr(line, '='); if (!eq) continue;
-        *eq = 0;
-        char* key = trimStr(line);
-        char* val = trimStr(eq + 1);
-        for (char* p = key; *p; ++p) *p = (char)tolower((unsigned char)*p);
-        if      (!strcmp(key,"multiplier"))      { int m=atoi(val); if (m>=2 && m<=4) g_cfg.fgMultiplier=m; }
-        else if (!strcmp(key,"flipmetering"))      g_cfg.flipMode = !_stricmp(val,"hardware")?1 : (!_stricmp(val,"auto")?2:0);
-        else if (!strcmp(key,"dlss"))              g_cfg.dlssSR = cfgBool(val);
-        else if (!strcmp(key,"hudlesstags"))       g_cfg.hudlessTags = cfgBool(val);
-        else if (!strcmp(key,"steamoverlayfix"))   g_cfg.steamFix = cfgBool(val);
-    }
-    fclose(f);
-    L("[CFG] fsr2dlss.ini: multiplier=%dx flipMetering=%d dlss=%d hudlessTags=%d steamFix=%d",
-      g_cfg.fgMultiplier, g_cfg.flipMode, (int)g_cfg.dlssSR, (int)g_cfg.hudlessTags, (int)g_cfg.steamFix);
 }
 
 // ---- minimal FfxApi types we parse (layouts verified from runtime) ----------
@@ -133,58 +75,57 @@ static PFun_slUpgradeInterface*       p_slUpgradeInterface;
 static PFun_slIsFeatureSupported*     p_slIsFeatureSupported;
 static PFun_slGetFeatureRequirements* p_slGetFeatureRequirements;
 static PFun_slGetFeatureFunction*     p_slGetFeatureFunction;
-static PFun_slSetTag*                 p_slSetTag;
+static PFun_slSetTag*                 p_slSetTag;            // deprecated global tagging (Compat LegacyTagging=true)
+static PFun_slSetTagForFrame*         p_slSetTagForFrame;    // frame-based tagging (default)
 static PFun_slSetConstants*           p_slSetConstants;
 static PFun_slGetNewFrameToken*       p_slGetNewFrameToken;
 static PFun_slSetFeatureLoaded*       p_slSetFeatureLoaded;
+static PFun_slEvaluateFeature*        p_slEvaluateFeature;
 // feature funcs
 static PFun_slDLSSGSetOptions*        p_slDLSSGSetOptions;
 static PFun_slDLSSGGetState*          p_slDLSSGGetState;
-static PFun_slReflexSetMarker*        p_slReflexSetMarker;   // 2.2 only (deprecated in 2.11)
 static PFun_slReflexSetOptions*       p_slReflexSetOptions;
 static PFun_slReflexSleep*            p_slReflexSleep;
-// DLSS super-resolution (replaces FSR upscale)
-static PFun_slEvaluateFeature*        p_slEvaluateFeature = nullptr;
-static PFun_slDLSSSetOptions*         p_slDLSSSetOptions  = nullptr;
-static uint32_t g_srFrameIdx  = 0x40000000; // SR frame-token space, separate from DLSS-G's
-static uint32_t g_srLastOutW  = 0, g_srLastOutH = 0; static int g_srLastMode = -1;
+static PFun_slPCLSetMarker*           p_slPCLSetMarker;      // per-frame latency markers live in sl.pcl
+static PFun_slDLSSSetOptions*         p_slDLSSSetOptions;
+
+static bool     g_frameTagging = false;      // slSetTagForFrame + eUseFrameBasedResourceTagging in use
+static uint32_t g_srFrameIdx  = 0x40000000;  // SR frame-token space when it cannot share DLSS-G's index
+static uint32_t g_srLastOutW  = 0, g_srLastOutH = 0; static int g_srLastMode = -1; static uint32_t g_srLastGen = 0xFFFFFFFF;
 static bool     g_srDisabled  = false;
 
-// 2.11+: per-frame latency markers live in sl.pcl (slReflexSetMarker is gone).
-static const sl::Feature kFeaturePCL = 4;
-typedef sl::Result (*PFnPCLSetMarker)(uint32_t marker, const sl::FrameToken& frame);
-static PFnPCLSetMarker p_slPCLSetMarker = nullptr;
-
-enum { PCL_SimStart = 0, PCL_SimEnd = 1, PCL_RenderStart = 2, PCL_RenderEnd = 3, PCL_PresentStart = 4, PCL_PresentEnd = 5 };
-static sl::FrameToken* g_curToken = nullptr;   // current frame token, shared with the Present wrapper
-static volatile LONG  g_presentMarks = 0;      // # present-marker pairs emitted by the wrapper
+static sl::FrameToken* g_curToken = nullptr;   // current DLSS-G frame token, shared with the Present hook
+static volatile LONG  g_presentMarks = 0;      // # present-marker pairs emitted by the hook
 static unsigned long  g_presentTid   = 0;      // thread that calls Present (should == feedTid)
-static bool           g_wrapperLive   = false; // has the game ever called our wrapper's Present?
+static bool           g_hookLive     = false;  // has the game ever called our hooked Present?
 
 static bool          g_slReady   = false;
 static ID3D12Device* g_device    = nullptr;
-static const char* resStr(sl::Result r);
 
 // ---- per-frame feeding state -----------------------------------------------
-#include <cmath>
 struct FfxResourceLite { void* res; uint32_t format, width, height, state; };
 static FfxResourceLite g_hudless = {};   // from FRAMEGEN configure 0x00020002
 struct BridgeCtx;                        // fwd
 static BridgeCtx* g_scCtx = nullptr;     // the active SL swapchain context
-static bool     g_fgEnabled = false;
+static ID3D12CommandQueue* g_queue = nullptr; // the game's present queue (from NEW_DX12)
+static bool     g_fgEnabled = false;     // the game's FG toggle (FRAMEGEN configure)
 static uint64_t g_frameID   = 0;
-static bool     g_reflexSet = false;
-static uint32_t g_dlssgMode = 0;         // 0=off 1=on (last requested)
 static unsigned g_frameCount = 0;
 static bool     g_diagShowInterpOnly = false; // DIAGNOSTIC: present only generated frames
 static uint32_t g_maxPresented   = 0;         // max numFramesActuallyPresented ever seen
 static uint32_t g_doubledFrames  = 0;         // # frames where presented >= 2
 static int      g_lastAppliedMode = -1;       // last DLSSGMode applied (-1 = never)
+static uint32_t g_lastAppliedGen  = 0;        // last numFramesToGenerate applied
 static uint32_t g_frameIdx       = 0;         // monotonic SL frame index (one token per frame)
 static uint32_t g_curFrameID     = 0xFFFFFFFF; // game's frameID for the current SL token
 static unsigned g_presentCount   = 0;         // presents seen (warmup gate for the Reflex sleep)
 static const unsigned WARMUP_PRESENTS = 120;  // skip the throttling sleep during fragile SL/swapchain init
 static bool     g_lastAppliedInterp = false;  // last interp-only flag applied
+static uint32_t g_dlssgMaxGen = 1;            // numFramesToGenerateMax reported by the card (1 = 2x only)
+static bool     g_dlssgDynamicOk = false;     // bIsDynamicMFGSupported
+static uint32_t g_dlssgStatus = 0;
+static uint64_t g_dlssgVram = 0;
+static uint32_t g_lastPresented = 0;          // numFramesActuallyPresented from the last state query
 // Dev toggles (no rebuild), all resolved next to the mod DLL: fg_interp.flag (show only generated
 // frames), fg_fpscap.txt (target FPS -> Reflex frame cap).
 static uint32_t g_frameLimitUs = 0;           // Reflex frame cap in microseconds (0 = uncapped)
@@ -225,6 +166,19 @@ static sl::Resource makeSlTex(void* native, uint32_t ffxState, uint32_t w, uint3
     // nativeFormat left 0: SL queries the real DXGI format from the ID3D12Resource.
     r.width = w; r.height = h; r.mipLevels = 1; r.arrayLayers = 1;
     return r;
+}
+
+// Tag resources for a frame. Frame-based tagging (slSetTagForFrame) is the current Streamline API;
+// the global slSetTag path is kept behind Compat LegacyTagging for troubleshooting. The two are
+// mutually exclusive per slInit (eUseFrameBasedResourceTagging), so the choice is fixed at init.
+static sl::Result setTags(sl::FrameToken* tok, const sl::ViewportHandle& vp, const sl::ResourceTag* tags, uint32_t n, void* cmdList)
+{
+    if (g_frameTagging) {
+        if (!tok) return sl::Result::eErrorMissingInputParameter;
+        return p_slSetTagForFrame(*tok, vp, tags, n, (sl::CommandBuffer*)cmdList);
+    }
+    if (!p_slSetTag) return sl::Result::eErrorNotInitialized;
+    return p_slSetTag(vp, tags, n, (sl::CommandBuffer*)cmdList);
 }
 
 // Reversed-Z infinite-far perspective (row-major, row-vector); depthInverted=true.
@@ -295,8 +249,12 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
 {
     if (g_slReady) return true;
     g_device = (ID3D12Device*)deviceV;
-    loadConfig();
-    L("[SL] init begin dir=%ls device=%p", slDir, deviceV);
+    config_load();
+    L("[SL] init begin dir=%ls device=%p (SDK headers %d.%d.%d)", slDir, deviceV, SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+    L("[CFG] fgMode=%s multiplier=%dx dynFps=%.0f flipMetering=%d dlss=%d quality=%s preset=%s steamFix=%d overlay=%d key=%s showFps=%d hudlessTags=%d legacyTagging=%d",
+      config_fg_mode_name(g_cfg.fgMode), g_cfg.fgMultiplier, g_cfg.fgDynamicFps, g_cfg.flipMode, (int)g_cfg.dlssSR,
+      config_sr_quality_name(g_cfg.srQuality), config_sr_preset_name(g_cfg.srPreset), (int)g_cfg.steamFix,
+      (int)g_cfg.overlayOn, config_key_name(g_cfg.overlayKey), (int)g_cfg.showFps, (int)g_cfg.hudlessTags, (int)g_cfg.legacyTagging);
 
     // Flip metering. With FlipMetering=hardware (the shipped default) we leave SetFlipConfig alone,
     // and Blackwell's hardware flip queue paces the generated frames for true 3x/4x MFG. With
@@ -319,26 +277,36 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
     p_slGetFeatureRequirements = (PFun_slGetFeatureRequirements*)GP(h, "slGetFeatureRequirements");
     p_slGetFeatureFunction     = (PFun_slGetFeatureFunction*)    GP(h, "slGetFeatureFunction");
     p_slSetTag                 = (PFun_slSetTag*)                GP(h, "slSetTag");
+    p_slSetTagForFrame         = (PFun_slSetTagForFrame*)        GP(h, "slSetTagForFrame");
     p_slSetConstants           = (PFun_slSetConstants*)          GP(h, "slSetConstants");
     p_slGetNewFrameToken       = (PFun_slGetNewFrameToken*)      GP(h, "slGetNewFrameToken");
     p_slSetFeatureLoaded       = (PFun_slSetFeatureLoaded*)      GP(h, "slSetFeatureLoaded");
     p_slEvaluateFeature        = (PFun_slEvaluateFeature*)       GP(h, "slEvaluateFeature");
-    if (!p_slInit || !p_slSetD3DDevice || !p_slUpgradeInterface) { L("[SL] missing core exports"); return false; }
+    if (!p_slInit || !p_slSetD3DDevice || !p_slUpgradeInterface || !p_slGetNewFrameToken || !p_slSetConstants) { L("[SL] missing core exports"); return false; }
 
-    static const sl::Feature feats[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, kFeaturePCL };
+    g_frameTagging = !g_cfg.legacyTagging && p_slSetTagForFrame != nullptr;
+    if (!g_frameTagging && !p_slSetTag) { L("[SL] neither slSetTagForFrame nor slSetTag exported"); return false; }
+    g_stats.frameTagging = g_frameTagging;
+
+    static const sl::Feature feats[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
     sl::Preferences pref{};
-    pref.logLevel          = sl::LogLevel::eVerbose;
+    pref.logLevel          = g_cfg.debug ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
     pref.pathsToPlugins    = &slDir;
     pref.numPathsToPlugins = 1;
     pref.pathToLogsAndData = slDir;
     pref.featuresToLoad    = feats;
     pref.numFeaturesToLoad = 4;
-    // We report Streamline 2.7.4 as the host SDK version. That plugin set uses the global slSetTag
-    // path (frame-based slSetTagForFrame only exists from 2.7.30) and understands v5 DLSSGOptions
-    // (numFramesToGenerate for multi-frame generation), which is what we rely on for 3x/4x MFG.
-    const uint64_t hostVer = ((uint64_t)2 << 48) | ((uint64_t)7 << 32) | ((uint64_t)4 << 16) | 0xfedcULL;
-
+    // Manual hooking only. Do NOT set eDisableCLStateTracking: DLSS super-resolution is evaluated on the
+    // game's own command list mid-frame, and the game keeps recording on it afterwards, so SL must
+    // restore the command list state after slEvaluateFeature.
     pref.flags             = sl::PreferenceFlags::eUseManualHooking;
+    // Frame-based resource tagging is the Streamline 2.7.30+ model: every tag is bound to a frame
+    // token, so DLSS-G reads exactly the buffers tagged for the frame it is presenting. We report the
+    // SDK version we compile against. LegacyTagging reproduces the pre-2.14 builds: global slSetTag and
+    // host SDK 2.7.4 (that pairing used the global tag path and v5 DLSSGOptions).
+    uint64_t hostVer = sl::kSDKVersion;
+    if (g_frameTagging) pref.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    else                hostVer = ((uint64_t)2 << 48) | ((uint64_t)7 << 32) | ((uint64_t)4 << 16) | sl::kSDKVersionMagic;
     pref.engine            = sl::EngineType::eCustom;
     pref.engineVersion     = "1.0.0";
     pref.projectId         = "{E57EBA73-277D-4D76-8C29-60AB8155FA36}";
@@ -346,8 +314,9 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
     pref.renderAPI         = sl::RenderAPI::eD3D12;
 
     sl::Result r = p_slInit(pref, hostVer);
-    L("[SL] slInit(host=2.7.4) -> %d (%s)", (int)r, resStr(r));
+    L("[SL] slInit(host=%u.%u.%u, frameTagging=%d) -> %d (%s)", (unsigned)(hostVer >> 48), (unsigned)((hostVer >> 32) & 0xffff), (unsigned)((hostVer >> 16) & 0xffff), (int)g_frameTagging, (int)r, resStr(r));
     if (r != sl::Result::eOk) return false;
+    g_stats.slVersion[0] = SL_VERSION_MAJOR; g_stats.slVersion[1] = SL_VERSION_MINOR; g_stats.slVersion[2] = SL_VERSION_PATCH;
     r = p_slSetD3DDevice(deviceV);
     L("[SL] slSetD3DDevice -> %d (%s)", (int)r, resStr(r));
 
@@ -355,7 +324,16 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
     sl::AdapterInfo ai{}; ai.deviceLUID = (uint8_t*)&luid; ai.deviceLUIDSizeInBytes = sizeof(luid);
     sl::Result rg = p_slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
     L("[SL] DLSS_G supported -> %d (%s)", (int)rg, resStr(rg));
-    if (rg != sl::Result::eOk) { L("[SL] DLSS_G not supported; bridge disabled"); return false; }
+    if (rg != sl::Result::eOk) {
+        if (p_slGetFeatureRequirements) {
+            sl::FeatureRequirements req{};
+            if (p_slGetFeatureRequirements(sl::kFeatureDLSS_G, req) == sl::Result::eOk)
+                L("[SL] DLSS_G requirements: flags=0x%x os=%u.%u.%u (need %u.%u.%u) driver=%u.%u.%u (need %u.%u.%u)", (unsigned)req.flags,
+                  req.osVersionDetected.major, req.osVersionDetected.minor, req.osVersionDetected.build, req.osVersionRequired.major, req.osVersionRequired.minor, req.osVersionRequired.build,
+                  req.driverVersionDetected.major, req.driverVersionDetected.minor, req.driverVersionDetected.build, req.driverVersionRequired.major, req.driverVersionRequired.minor, req.driverVersionRequired.build);
+        }
+        L("[SL] DLSS_G not supported; bridge disabled"); return false;
+    }
     // Activate DLSS super-resolution too, so slGetFeatureFunction can hand back its options fn.
     sl::Result rd = p_slIsFeatureSupported(sl::kFeatureDLSS, ai);
     L("[SL] DLSS(SR) supported -> %d (%s)", (int)rd, resStr(rd));
@@ -364,165 +342,120 @@ extern "C" bool slbridge_init(void* deviceV, const wchar_t* slDir)
         p_slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)p_slDLSSGSetOptions);
         p_slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState",   (void*&)p_slDLSSGGetState);
         p_slGetFeatureFunction(sl::kFeatureDLSS,   "slDLSSSetOptions",  (void*&)p_slDLSSSetOptions);
-        p_slGetFeatureFunction(sl::kFeatureReflex, "slReflexSetMarker", (void*&)p_slReflexSetMarker);
         p_slGetFeatureFunction(sl::kFeatureReflex, "slReflexSetOptions",(void*&)p_slReflexSetOptions);
         p_slGetFeatureFunction(sl::kFeatureReflex, "slReflexSleep",     (void*&)p_slReflexSleep);
-        p_slGetFeatureFunction(kFeaturePCL,        "slPCLSetMarker",    (void*&)p_slPCLSetMarker);
+        p_slGetFeatureFunction(sl::kFeaturePCL,    "slPCLSetMarker",    (void*&)p_slPCLSetMarker);
     }
-    L("[SL] feature funcs: dlssgSetOpt=%p reflexMarker=%p pclMarker=%p reflexOpt=%p sleep=%p",
-      (void*)p_slDLSSGSetOptions, (void*)p_slReflexSetMarker, (void*)p_slPCLSetMarker, (void*)p_slReflexSetOptions, (void*)p_slReflexSleep);
+    L("[SL] feature funcs: dlssgSetOpt=%p dlssgGetState=%p dlssSetOpt=%p pclMarker=%p reflexOpt=%p sleep=%p",
+      (void*)p_slDLSSGSetOptions, (void*)p_slDLSSGGetState, (void*)p_slDLSSSetOptions, (void*)p_slPCLSetMarker, (void*)p_slReflexSetOptions, (void*)p_slReflexSleep);
+    if (!p_slDLSSGSetOptions) { L("[SL] slDLSSGSetOptions missing; bridge disabled"); return false; }
 
     g_slReady = true;
     L("[SL] init complete, bridge ready");
     return true;
 }
 
-// ---- swapchain wrapper: brackets Present with PCL present markers ------------
-// DLSS-G paces generated frames off the ePresentStart/ePresentEnd markers, which
-// must wrap the real Present call. The game calls Present on whatever we hand it,
-// so we hand it this thin proxy that forwards everything to the SL swapchain.
-class SwapChainProxy : public IDXGISwapChain4
-{
-    IDXGISwapChain4* m_inner;
-    volatile LONG    m_ref;
-public:
-    SwapChainProxy(IDXGISwapChain4* in) : m_inner(in), m_ref(1) {}
-
-    void presentMarker(int which) {
-        g_presentTid = GetCurrentThreadId();
-        if (!g_curToken) return;
-        if      (p_slPCLSetMarker)    p_slPCLSetMarker(which == 0 ? PCL_PresentStart : PCL_PresentEnd, *g_curToken);
-        else if (p_slReflexSetMarker) p_slReflexSetMarker(which == 0 ? sl::ReflexMarker::ePresentStart : sl::ReflexMarker::ePresentEnd, *g_curToken);
-        else return;
-        if (which == 0) InterlockedIncrement(&g_presentMarks);
-    }
-    HRESULT STDMETHODCALLTYPE Present(UINT s, UINT f) override {
-        logPresent("Present", s, f);
-        presentMarker(0);
-        HRESULT hr = m_inner->Present(s, f);
-        presentMarker(1);
-        return hr;
-    }
-    HRESULT STDMETHODCALLTYPE Present1(UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p) override {
-        logPresent("Present1", s, f);
-        presentMarker(0);
-        HRESULT hr = m_inner->Present1(s, f, p);
-        presentMarker(1);
-        return hr;
-    }
-    void logPresent(const char* who, UINT s, UINT f) {
-        static unsigned n = 0;
-        if (!g_wrapperLive) { g_wrapperLive = true; L("[PRESENT] FIRST wrapper present call -> wrapper is live"); }
-        if ((n++ % 600) == 0) L("[PRESENT] %s #%u presentTid=%lu syncInterval=%u flags=0x%x token=%p marker=%p reflexMk=%p (feedTid=%lu)",
-                                who, n, GetCurrentThreadId(), s, f, (void*)g_curToken, (void*)p_slPCLSetMarker, (void*)p_slReflexSetMarker, g_feedTid);
-    }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (IsEqualGUID(riid, __uuidof(IUnknown)) || IsEqualGUID(riid, __uuidof(IDXGIObject)) ||
-            IsEqualGUID(riid, __uuidof(IDXGIDeviceSubObject)) || IsEqualGUID(riid, __uuidof(IDXGISwapChain)) ||
-            IsEqualGUID(riid, __uuidof(IDXGISwapChain1)) || IsEqualGUID(riid, __uuidof(IDXGISwapChain2)) ||
-            IsEqualGUID(riid, __uuidof(IDXGISwapChain3)) || IsEqualGUID(riid, __uuidof(IDXGISwapChain4))) {
-            AddRef(); *ppv = static_cast<IDXGISwapChain4*>(this); return S_OK;
-        }
-        return m_inner->QueryInterface(riid, ppv);
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&m_ref);
-        if (r == 0) { m_inner->Release(); delete this; }
-        return (ULONG)r;
-    }
-    // IDXGIObject
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID n, UINT s, const void* d) override { return m_inner->SetPrivateData(n, s, d); }
-    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID n, const IUnknown* u) override { return m_inner->SetPrivateDataInterface(n, u); }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID n, UINT* s, void* d) override { return m_inner->GetPrivateData(n, s, d); }
-    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** pp) override { return m_inner->GetParent(riid, pp); }
-    // IDXGIDeviceSubObject
-    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** pp) override { return m_inner->GetDevice(riid, pp); }
-    // IDXGISwapChain
-    HRESULT STDMETHODCALLTYPE GetBuffer(UINT i, REFIID riid, void** pp) override { return m_inner->GetBuffer(i, riid, pp); }
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fs, IDXGIOutput* o) override { return m_inner->SetFullscreenState(fs, o); }
-    HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** o) override { return m_inner->GetFullscreenState(fs, o); }
-    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* d) override { return m_inner->GetDesc(d); }
-    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT c, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl) override { return m_inner->ResizeBuffers(c, w, h, fmt, fl); }
-    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* p) override { return m_inner->ResizeTarget(p); }
-    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** o) override { return m_inner->GetContainingOutput(o); }
-    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* st) override { return m_inner->GetFrameStatistics(st); }
-    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* c) override { return m_inner->GetLastPresentCount(c); }
-    // IDXGISwapChain1
-    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* d) override { return m_inner->GetDesc1(d); }
-    HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* d) override { return m_inner->GetFullscreenDesc(d); }
-    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* h) override { return m_inner->GetHwnd(h); }
-    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID riid, void** pp) override { return m_inner->GetCoreWindow(riid, pp); }
-    BOOL    STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return m_inner->IsTemporaryMonoSupported(); }
-    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** o) override { return m_inner->GetRestrictToOutput(o); }
-    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* c) override { return m_inner->SetBackgroundColor(c); }
-    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA* c) override { return m_inner->GetBackgroundColor(c); }
-    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION r) override { return m_inner->SetRotation(r); }
-    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* r) override { return m_inner->GetRotation(r); }
-    // IDXGISwapChain2
-    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT w, UINT h) override { return m_inner->SetSourceSize(w, h); }
-    HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* w, UINT* h) override { return m_inner->GetSourceSize(w, h); }
-    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT m) override { return m_inner->SetMaximumFrameLatency(m); }
-    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* m) override { return m_inner->GetMaximumFrameLatency(m); }
-    HANDLE  STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return m_inner->GetFrameLatencyWaitableObject(); }
-    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* m) override { return m_inner->SetMatrixTransform(m); }
-    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* m) override { return m_inner->GetMatrixTransform(m); }
-    // IDXGISwapChain3
-    UINT    STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return m_inner->GetCurrentBackBufferIndex(); }
-    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE cs, UINT* f) override { return m_inner->CheckColorSpaceSupport(cs, f); }
-    HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE cs) override { return m_inner->SetColorSpace1(cs); }
-    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT c, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl, const UINT* nodes, IUnknown* const* q) override { return m_inner->ResizeBuffers1(c, w, h, fmt, fl, nodes, q); }
-    // IDXGISwapChain4
-    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s, void* d) override { return m_inner->SetHDRMetaData(t, s, d); }
-};
-
-// ---- in-place Present vtable hook -------------------------------------------
+// ---- in-place Present/ResizeBuffers vtable hooks ----------------------------
 // We hand the game Streamline's real swapchain rather than a COM wrapper: a wrapper
 // pointer can break SL's swapchain identity and its flip-metering binding, and adds a
 // COM-lifetime crash risk. Instead we detour Present/Present1 in place on the real
-// swapchain so we can bracket each present with PCL markers.
+// swapchain so we can bracket each present with PCL markers (and draw the overlay),
+// and ResizeBuffers/ResizeBuffers1 so the overlay drops its back-buffer work first.
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present1)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
-static PFN_Present  g_origPresent  = nullptr;
-static PFN_Present1 g_origPresent1 = nullptr;
+typedef HRESULT (STDMETHODCALLTYPE *PFN_ResizeBuffers)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_ResizeBuffers1)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+static PFN_Present        g_origPresent        = nullptr;
+static PFN_Present1       g_origPresent1       = nullptr;
+static PFN_ResizeBuffers  g_origResizeBuffers  = nullptr;
+static PFN_ResizeBuffers1 g_origResizeBuffers1 = nullptr;
 
-// Emit one PCL/Reflex marker on the given token (sl.pcl preferred; sl.reflex fallback).
-// PCL_* enum values match sl::ReflexMarker for 0..5, so the cast is safe.
-static void mark(int m, sl::FrameToken* tok)
+// Emit one PCL marker on the given token.
+static void mark(sl::PCLMarker m, sl::FrameToken* tok)
 {
-    if (!tok) return;
-    if      (p_slPCLSetMarker)    p_slPCLSetMarker((uint32_t)m, *tok);
-    else if (p_slReflexSetMarker) p_slReflexSetMarker((sl::ReflexMarker)m, *tok);
-}
-// Create the FrameToken for the NEXT frame (one token per frame, explicit monotonic index).
-static bool newToken()
-{
-    if (!p_slGetNewFrameToken) return false;
-    uint32_t idx = ++g_frameIdx;
-    sl::FrameToken* t = nullptr;
-    if (p_slGetNewFrameToken(t, &idx) != sl::Result::eOk || !t) return false;
-    g_curToken = t;
-    return true;
+    if (!tok || !p_slPCLSetMarker) return;
+    p_slPCLSetMarker(m, *tok);
 }
 
-static sl::Result setDlssgOptions(uint32_t mode, bool interpOnly);  // defined below
+// Current DLSS-G request from the configuration + the game's FG toggle.
+// Returns the sl::DLSSGMode and fills numFramesToGenerate (clamped to the card's maximum).
+static sl::DLSSGMode wantedFgMode(uint32_t& numGen)
+{
+    uint32_t want = (uint32_t)(g_cfg.fgMultiplier > 1 ? g_cfg.fgMultiplier - 1 : 1);
+    if (g_dlssgMaxGen >= 1 && want > g_dlssgMaxGen) want = g_dlssgMaxGen;
+    numGen = want;
+    if (!g_fgEnabled || g_cfg.fgMode == FG_OFF) return sl::DLSSGMode::eOff;
+    if (g_cfg.fgMode == FG_DYNAMIC && g_dlssgDynamicOk) return sl::DLSSGMode::eDynamic;
+    return sl::DLSSGMode::eOn;
+}
+
+static sl::Result setDlssgOptions(sl::DLSSGMode mode, uint32_t numGen, bool interpOnly)
+{
+    if (!p_slDLSSGSetOptions) return sl::Result::eErrorNotInitialized;
+    sl::DLSSGOptions o;   // kStructVersion5: numFramesToGenerate (MFG), queueParallelismMode, dynamicTargetFrameRate
+    o.mode = mode;
+    o.numFramesToGenerate = numGen;
+    o.flags = interpOnly ? sl::DLSSGFlags::eShowOnlyInterpolatedFrame : sl::DLSSGFlags{};
+    o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;   // without it the generated frame is dropped
+    o.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
+    o.dynamicTargetFrameRate = (mode == sl::DLSSGMode::eDynamic) ? g_cfg.fgDynamicFps : 0.0f;
+    sl::ViewportHandle vp{0};
+    return p_slDLSSGSetOptions(vp, o);
+}
+
+// Query DLSS-G state (present thread). Tracks the card's limits and the frames reaching the display.
+static void queryDlssgState()
+{
+    if (!p_slDLSSGGetState) return;
+    sl::ViewportHandle vp{0};
+    sl::DLSSGState st;   // kStructVersion4: numFramesToGenerateMax, bIsDynamicMFGSupported
+    if (p_slDLSSGGetState(vp, st, nullptr) != sl::Result::eOk) return;
+    if (st.numFramesToGenerateMax >= 1 && st.numFramesToGenerateMax <= 8) g_dlssgMaxGen = st.numFramesToGenerateMax;
+    g_dlssgDynamicOk = (st.bIsDynamicMFGSupported == sl::Boolean::eTrue);
+    g_dlssgStatus = (uint32_t)st.status;
+    g_dlssgVram = st.estimatedVRAMUsageInBytes;
+    g_lastPresented = st.numFramesActuallyPresented;
+    if (st.numFramesActuallyPresented > g_maxPresented) g_maxPresented = st.numFramesActuallyPresented;
+    if (st.numFramesActuallyPresented >= 2) ++g_doubledFrames;
+    g_stats.fgMaxGen = g_dlssgMaxGen; g_stats.fgDynamicOk = g_dlssgDynamicOk; g_stats.fgStatus = g_dlssgStatus; g_stats.fgVramBytes = g_dlssgVram;
+}
+
+// Framerate statistics for the overlay: real presents per second (the game presents once per
+// rendered frame) and frames reaching the display per second (sum of numFramesActuallyPresented).
+static void updateFpsStats()
+{
+    static ULONGLONG s_last = 0; static unsigned s_lastPresents = 0; static uint64_t s_lastShown = 0;
+    static uint64_t s_shown = 0;
+    s_shown += g_lastPresented;
+    ULONGLONG now = GetTickCount64();
+    if (!s_last) { s_last = now; s_lastPresents = g_presentCount; s_lastShown = s_shown; return; }
+    ULONGLONG dt = now - s_last;
+    if (dt < 500) return;
+    float base = (g_presentCount - s_lastPresents) * 1000.0f / (float)dt;
+    uint64_t shown = s_shown - s_lastShown;
+    float disp = shown ? shown * 1000.0f / (float)dt : base;
+    if (disp < base) disp = base;
+    g_stats.baseFps = base; g_stats.displayFps = disp;
+    s_last = now; s_lastPresents = g_presentCount; s_lastShown = s_shown;
+}
 
 // Reflex present loop, part 1: just before the real Present(), assert options and ePresentStart.
 static void presentPre()
 {
     g_presentTid = GetCurrentThreadId();
-    if (!g_wrapperLive) { g_wrapperLive = true; L("[PRESENT] FIRST hooked present -> live (tid=%lu)", g_presentTid); }
+    if (!g_hookLive) { g_hookLive = true; L("[PRESENT] FIRST hooked present -> live (tid=%lu)", g_presentTid); }
     if (!g_curToken) return;
     // Re-assert DLSS-G options every frame on the present thread, right before Present. Streamline
     // requires the options be set on the presenting thread so it can bind them to the right Present.
     {
-        int wantMode = g_fgEnabled ? 1 : 0;
-        sl::Result orr = setDlssgOptions((uint32_t)wantMode, g_diagShowInterpOnly);
-        if (wantMode != g_lastAppliedMode || g_diagShowInterpOnly != g_lastAppliedInterp) {
-            L("[FGC] slDLSSGSetOptions(mode=%d interpOnly=%d v5 qpm=block) -> %d (%s)", wantMode, (int)g_diagShowInterpOnly, (int)orr, resStr(orr));
-            g_lastAppliedMode = wantMode; g_lastAppliedInterp = g_diagShowInterpOnly;
+        uint32_t numGen = 1;
+        sl::DLSSGMode mode = wantedFgMode(numGen);
+        sl::Result orr = setDlssgOptions(mode, numGen, g_diagShowInterpOnly);
+        if ((int)mode != g_lastAppliedMode || numGen != g_lastAppliedGen || g_diagShowInterpOnly != g_lastAppliedInterp) {
+            L("[FGC] slDLSSGSetOptions(mode=%s numFramesToGenerate=%u interpOnly=%d) -> %d (%s)", sl::getDLSSGModeAsStr(mode), numGen, (int)g_diagShowInterpOnly, (int)orr, resStr(orr));
+            g_lastAppliedMode = (int)mode; g_lastAppliedGen = numGen; g_lastAppliedInterp = g_diagShowInterpOnly;
         }
+        g_stats.fgApplied = (mode == sl::DLSSGMode::eOff) ? 0 : (mode == sl::DLSSGMode::eDynamic ? 1 : numGen + 1);
     }
     // Reflex options before Present. useMarkersToOptimize stays false: this game is single-threaded
     // and emits no genuine sim/submit markers, so letting Reflex optimize off them corrupts the pacer
@@ -532,9 +465,9 @@ static void presentPre()
         ro.useMarkersToOptimize = false;
         p_slReflexSetOptions(ro);
     }
-    // Close the render-submit interval, then open present (full marker cadence for the SW pacer).
-    mark(PCL_RenderEnd,    g_curToken);
-    mark(PCL_PresentStart, g_curToken);
+    // Close the render-submit interval, then open present (full marker cadence for the pacer).
+    mark(sl::PCLMarker::eRenderSubmitEnd, g_curToken);
+    mark(sl::PCLMarker::ePresentStart,    g_curToken);
     InterlockedIncrement(&g_presentMarks);
 }
 // Reflex present loop, part 2: just after the real Present() returns, which is the true frame
@@ -543,12 +476,16 @@ static void presentPre()
 // next real frame and gives flip metering a steady cadence to meter against.
 static void presentPost()
 {
+    ++g_presentCount;
+    queryDlssgState();
+    updateFpsStats();
     if (!g_curToken) return;
-    mark(PCL_PresentEnd, g_curToken);   // the token advances in feedDLSSG, keyed by the game's frameID
-    if (g_presentCount++ >= WARMUP_PRESENTS && p_slReflexSleep) p_slReflexSleep(*g_curToken);
+    mark(sl::PCLMarker::ePresentEnd, g_curToken);   // the token advances in feedDLSSG, keyed by the game's frameID
+    if (g_presentCount >= WARMUP_PRESENTS && p_slReflexSleep) p_slReflexSleep(*g_curToken);
 }
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT f)
 {
+    overlay_render((IDXGISwapChain3*)This);   // overlay is render-submit work: before the markers
     presentPre();
     HRESULT hr = g_origPresent(This, s, f);
     presentPost();
@@ -556,26 +493,43 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT
 }
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* This, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p)
 {
+    overlay_render((IDXGISwapChain3*)This);
     presentPre();
     HRESULT hr = g_origPresent1(This, s, f, p);
     presentPost();
     return hr;
 }
-// IDXGISwapChain vtable: Present=8, IDXGISwapChain1::Present1=22. Idempotent.
-static void hookSwapchainPresent(IDXGISwapChain4* sc)
+static HRESULT STDMETHODCALLTYPE Hook_ResizeBuffers(IDXGISwapChain* This, UINT c, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl)
+{
+    L("[SC] ResizeBuffers(%u, %ux%u, fmt=%u, flags=0x%x)", c, w, h, (unsigned)fmt, fl);
+    overlay_before_resize();
+    return g_origResizeBuffers(This, c, w, h, fmt, fl);
+}
+static HRESULT STDMETHODCALLTYPE Hook_ResizeBuffers1(IDXGISwapChain3* This, UINT c, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl, const UINT* nodes, IUnknown* const* q)
+{
+    L("[SC] ResizeBuffers1(%u, %ux%u, fmt=%u, flags=0x%x)", c, w, h, (unsigned)fmt, fl);
+    overlay_before_resize();
+    return g_origResizeBuffers1(This, c, w, h, fmt, fl, nodes, q);
+}
+// IDXGISwapChain vtable: Present=8, ResizeBuffers=13, IDXGISwapChain1::Present1=22,
+// IDXGISwapChain3::ResizeBuffers1=39. Idempotent.
+static void hookVtbl(void** vtbl, int idx, void* hook, void** orig)
+{
+    if (vtbl[idx] == hook) return;
+    DWORD oldp;
+    if (VirtualProtect(&vtbl[idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp)) {
+        *orig = vtbl[idx];
+        vtbl[idx] = hook;
+        VirtualProtect(&vtbl[idx], sizeof(void*), oldp, &oldp);
+    }
+}
+static void hookSwapchain(IDXGISwapChain4* sc)
 {
     void** vtbl = *(void***)sc;
-    DWORD oldp;
-    if (vtbl[8] != (void*)&Hook_Present && VirtualProtect(&vtbl[8], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp)) {
-        g_origPresent = (PFN_Present)vtbl[8];
-        vtbl[8] = (void*)&Hook_Present;
-        VirtualProtect(&vtbl[8], sizeof(void*), oldp, &oldp);
-    }
-    if (vtbl[22] != (void*)&Hook_Present1 && VirtualProtect(&vtbl[22], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldp)) {
-        g_origPresent1 = (PFN_Present1)vtbl[22];
-        vtbl[22] = (void*)&Hook_Present1;
-        VirtualProtect(&vtbl[22], sizeof(void*), oldp, &oldp);
-    }
+    hookVtbl(vtbl, 8,  (void*)&Hook_Present,        (void**)&g_origPresent);
+    hookVtbl(vtbl, 22, (void*)&Hook_Present1,       (void**)&g_origPresent1);
+    hookVtbl(vtbl, 13, (void*)&Hook_ResizeBuffers,  (void**)&g_origResizeBuffers);
+    hookVtbl(vtbl, 39, (void*)&Hook_ResizeBuffers1, (void**)&g_origResizeBuffers1);
     // Which module owns the original Present we detoured? If it's dxgi.dll (native) rather than
     // sl.interposer.dll, we're bypassing SL's DLSS-G present entirely -> no interpolation.
     HMODULE mod = nullptr; char modName[MAX_PATH] = {0};
@@ -583,66 +537,8 @@ static void hookSwapchainPresent(IDXGISwapChain4* sc)
                                             (LPCSTR)g_origPresent, &mod) && mod) {
         GetModuleFileNameA(mod, modName, MAX_PATH);
     }
-    L("[SC] hooked Present(orig=%p) Present1(orig=%p) on sc4=%p  origPresentModule=%s",
-      (void*)g_origPresent, (void*)g_origPresent1, (void*)sc, modName[0] ? modName : "<unknown>");
-}
-
-// The sl2.2 header we build against only defines DLSSGOptions v1 (no numFramesToGenerate or
-// queueParallelismMode). We lay out v5 by hand so we can request multi-frame generation and set
-// eBlockPresentingClientQueue, without which the generated frame is dropped.
-// GUID fac5f1cb-2dfd-4f36-a1e6-3a9e865256c5.
-#pragma pack(push, 8)
-struct DLSSGOptions5 {
-    void*    next = nullptr;
-    uint32_t g0 = 0xfac5f1cb; uint16_t g1 = 0x2dfd, g2 = 0x4f36; uint8_t g3[8] = {0xa1,0xe6,0x3a,0x9e,0x86,0x52,0x56,0xc5};
-    uint64_t structVersion = 5;
-    uint32_t mode = 0;                 // DLSSGMode: 0=eOff 1=eOn
-    uint32_t numFramesToGenerate = 1;
-    uint32_t flags = 0;                // eShowOnlyInterpolatedFrame = 1<<0
-    uint32_t dynamicResWidth = 0, dynamicResHeight = 0;
-    uint32_t numBackBuffers = 0;
-    uint32_t mvecDepthWidth = 0, mvecDepthHeight = 0;
-    uint32_t colorWidth = 0, colorHeight = 0;
-    uint32_t colorBufferFormat = 0, mvecBufferFormat = 0, depthBufferFormat = 0, hudLessBufferFormat = 0, uiBufferFormat = 0;
-    void*    onErrorCallback = nullptr;
-    uint32_t bReserved15 = 2;          // Boolean::eInvalid
-    uint32_t queueParallelismMode = 0; // DLSSGQueueParallelismMode::eBlockPresentingClientQueue
-    uint32_t enableUserInterfaceRecomposition = 0; // Boolean::eFalse
-    float    dynamicTargetFrameRate = 0;
-};
-#pragma pack(pop)
-
-// Hand-laid DLSSGState v2 so we can read numFramesToGenerateMax (the card's MFG cap).
-// GUID cc8ac8e1-a179-44f5-97fa-e74112f9bc61.
-#pragma pack(push, 8)
-struct DLSSGState2 {
-    void*    next = nullptr;
-    uint32_t g0 = 0xcc8ac8e1; uint16_t g1 = 0xa179, g2 = 0x44f5; uint8_t g3[8] = {0x97,0xfa,0xe7,0x41,0x12,0xf9,0xbc,0x61};
-    uint64_t structVersion = 2;
-    uint64_t estimatedVRAMUsageInBytes = 0;
-    uint32_t status = 0;
-    uint32_t minWidthOrHeight = 0;
-    uint32_t numFramesActuallyPresented = 0;
-    uint32_t numFramesToGenerateMax = 0;
-};
-#pragma pack(pop)
-
-static uint32_t g_dlssgMaxGen = 1;   // numFramesToGenerateMax reported by the card (1 = 2x only)
-static sl::Result setDlssgOptions(uint32_t mode, bool interpOnly)
-{
-    if (!p_slDLSSGSetOptions) return sl::Result::eErrorNotInitialized;
-    DLSSGOptions5 o;
-    o.structVersion = 5;   // v5 carries numFramesToGenerate (multi-frame generation)
-    o.mode = mode;
-    // Multi-frame gen: multiplier N -> N-1 generated frames. Clamp to the card's reported max
-    // (populated from DLSSGState in feedDLSSG); defaults to 1 (2x) which is safe on any card.
-    uint32_t want = (uint32_t)(g_cfg.fgMultiplier > 1 ? g_cfg.fgMultiplier - 1 : 1);
-    if (g_dlssgMaxGen >= 1 && want > g_dlssgMaxGen) want = g_dlssgMaxGen;
-    o.numFramesToGenerate = want;
-    o.flags = interpOnly ? 1u : 0u;
-    o.queueParallelismMode = 0;   // eBlockPresentingClientQueue (v3+, ignored at v1)
-    sl::ViewportHandle vp{0};
-    return p_slDLSSGSetOptions(vp, *(const sl::DLSSGOptions*)&o);
+    L("[SC] hooked Present(orig=%p) Present1(orig=%p) ResizeBuffers(orig=%p) on sc4=%p  origPresentModule=%s",
+      (void*)g_origPresent, (void*)g_origPresent1, (void*)g_origResizeBuffers, (void*)sc, modName[0] ? modName : "<unknown>");
 }
 
 // ---- swapchain substitution -------------------------------------------------
@@ -707,7 +603,6 @@ extern "C" void* slbridge_create_swapchain(void* oldDescV, void* factoryV, void*
     BridgeCtx* c = new BridgeCtx();
     c->magic = CTX_MAGIC; c->kind = CTX_SWAPCHAIN; c->sc4 = sc4;
     c->texDesc = { /*type TEX2D*/2, 0 /*fill below*/, d1.Width, d1.Height, 1, 1, 0, /*usage RT|UAV*/3 };
-    // map the DXGI format roughly into an FfxApiSurfaceFormat-ish value isn't needed for B; store raw later.
 
     // Dummy command list (returned for InterpolationCommandList queries).
     g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&c->dummyAlloc));
@@ -726,11 +621,11 @@ extern "C" void* slbridge_create_swapchain(void* oldDescV, void* factoryV, void*
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         HRESULT thr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                           D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c->dummyTex));
-        c->texDesc.format = (uint32_t)d1.Format; // store DXGI format; B doesn't use it semantically
+        c->texDesc.format = (uint32_t)d1.Format; // store DXGI format; the game does not use it semantically
         if (FAILED(thr)) L("[SC] dummy interp texture create hr=0x%08lx", (unsigned long)thr);
     }
-    // Transparent UIColorAndAlpha surface (R8G8B8A8 - 8-bit alpha). DLSS-G in 2.11
-    // requires a UI tag; the game bakes UI into the backbuffer so we feed an empty one.
+    // Transparent UIColorAndAlpha surface (R8G8B8A8 - 8-bit alpha). The game bakes UI into the
+    // backbuffer so we feed an empty one when HudlessTags is on.
     c->dispW = d1.Width; c->dispH = d1.Height;
     {
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -748,15 +643,21 @@ extern "C" void* slbridge_create_swapchain(void* oldDescV, void* factoryV, void*
     // Hand the game SL's REAL swapchain (preserves SL identity / flip-metering bind)
     // and detour its Present/Present1 in place for the PCL present markers. Two refs:
     // one for the game (Released when it destroys the swapchain), one kept in c->sc4.
-    hookSwapchainPresent(sc4);
+    hookSwapchain(sc4);
     sc4->AddRef();
     *outSwapchain = static_cast<IDXGISwapChain4*>(sc4);
     registerCtx(c);
     g_scCtx = c;
+    g_queue = queue;
     L("[SC] substituted SL swapchain sc4=%p (handed to game, Present hooked in place) ctx=%p", (void*)sc4, (void*)c);
 
-    // Leave DLSS-G OFF initially (passthrough); feedDLSSG turns it on.
-    { sl::Result orr = setDlssgOptions(0, false); L("[SC] slDLSSGSetOptions(eOff v5) -> %d (%s)", (int)orr, resStr(orr)); }
+    // Leave DLSS-G OFF initially (passthrough); the present hook turns it on once the game enables FG.
+    { sl::Result orr = setDlssgOptions(sl::DLSSGMode::eOff, 1, false); L("[SC] slDLSSGSetOptions(eOff) -> %d (%s)", (int)orr, resStr(orr)); }
+    queryDlssgState();
+    L("[SC] DLSS-G caps: numFramesToGenerateMax=%u (up to %ux) dynamicMFG=%d status=0x%x", g_dlssgMaxGen, g_dlssgMaxGen + 1, (int)g_dlssgDynamicOk, g_dlssgStatus);
+
+    // In-game overlay on the game's present queue and this swapchain.
+    if (g_cfg.overlayOn || g_cfg.showFps) overlay_init(g_device, queue, sc4, (void*)od->OutputWindow);
     return c;
 }
 
@@ -783,19 +684,18 @@ static const uint64_t T_FG_DISPATCH  = 0x00020003;
 // Frame start: called from the proxy on the first FfxApi call of the frame (UPSCALE dispatch).
 extern "C" void slbridge_frame_start()
 {
-    // No-op: the frame token + all Reflex/PCL markers are driven from feedDLSSG, keyed by the
+    // No-op: the frame token + all PCL markers are driven from feedDLSSG, keyed by the
     // game's frameID (the UPSCALE dispatch has no frameID to key on).
 }
 
 // Feed DLSS-G from the FRAMEGEN PREPARE dispatch (depth + MV + camera scalars).
 static void feedDLSSG(const void* d)
 {
-    if (!g_slReady || !p_slDLSSGSetOptions || !p_slSetTag || !p_slSetConstants || !p_slGetNewFrameToken) return;
+    if (!g_slReady || !p_slDLSSGSetOptions || !p_slSetConstants || !p_slGetNewFrameToken) return;
 
     void*    cmdList = rdPtr(d, 0x20);
     uint32_t renderW = rdU32(d, 0x28), renderH = rdU32(d, 0x2C);
     float    jitX = rdF32(d, 0x30), jitY = rdF32(d, 0x34);
-    float    mvsX = rdF32(d, 0x38), mvsY = rdF32(d, 0x3C);
     float    camNear = rdF32(d, 0x48), camFar = rdF32(d, 0x4C), camFov = rdF32(d, 0x50);
     void*    depthRes = rdPtr(d, 0x58); uint32_t depthFmt=rdU32(d,0x64), depthW=rdU32(d,0x68), depthH=rdU32(d,0x6C), depthSt=rdU32(d,0x80);
     void*    mvRes    = rdPtr(d, 0x88); uint32_t mvFmt=rdU32(d,0x94), mvW=rdU32(d,0x98), mvH=rdU32(d,0x9C), mvSt=rdU32(d,0xB0);
@@ -820,9 +720,9 @@ static void feedDLSSG(const void* d)
     g_feedTid = GetCurrentThreadId();
     // The DLSS-G pacer needs the full per-frame sim/render marker cadence.
     // eRenderSubmitEnd is emitted in presentPre just before the real Present.
-    mark(PCL_SimStart,    token);
-    mark(PCL_SimEnd,      token);
-    mark(PCL_RenderStart, token);
+    mark(sl::PCLMarker::eSimulationStart,   token);
+    mark(sl::PCLMarker::eSimulationEnd,     token);
+    mark(sl::PCLMarker::eRenderSubmitStart, token);
 
     sl::Resource depthR = makeSlTex(depthRes, depthSt, depthW, depthH, depthFmt);
     sl::Resource mvR    = makeSlTex(mvRes,    mvSt,    mvW,    mvH,    mvFmt);
@@ -839,7 +739,11 @@ static void feedDLSSG(const void* d)
         hudR = makeSlTex(g_hudless.res, g_hudless.state, g_hudless.width, g_hudless.height, g_hudless.format);
         tags[nt++] = sl::ResourceTag(&hudR, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &hudExt);
     }
-    p_slSetTag(vp, tags, nt, (sl::CommandBuffer*)cmdList);
+    {
+        sl::Result tr = setTags(token, vp, tags, (uint32_t)nt, cmdList);
+        static int tagErr = 0;
+        if (tr != sl::Result::eOk && tagErr < 5) { ++tagErr; L("[FGC] tag (%s) -> %d (%s)", g_frameTagging ? "slSetTagForFrame" : "slSetTag", (int)tr, resStr(tr)); }
+    }
 
     // Reversed-Z / infinite far: the game passes near=FLT_MAX, far=10 -> real near plane is the
     // finite value. Pick the finite one as zNear and treat the huge one as infinity.
@@ -886,32 +790,15 @@ static void feedDLSSG(const void* d)
 
     // slDLSSGSetOptions is asserted in presentPre() every frame on the present thread, right before
     // the real Present, because SL only guarantees the updated options bind to the next Present when
-    // they are set on the presenting thread.
-    g_dlssgMode = g_fgEnabled ? 1u : 0u;
-
-    // Query state EVERY frame (so numFramesActuallyPresented is per-frame, not a
-    // 240-frame-stale sample) and track the max/any doubling ever observed.
-    if (p_slDLSSGGetState) {
-        DLSSGState2 st{};
-        p_slDLSSGGetState(vp, *(sl::DLSSGState*)&st, nullptr);
-        if (st.numFramesToGenerateMax >= 1 && st.numFramesToGenerateMax <= 8) g_dlssgMaxGen = st.numFramesToGenerateMax;
-        if (st.numFramesActuallyPresented > g_maxPresented) g_maxPresented = st.numFramesActuallyPresented;
-        if (st.numFramesActuallyPresented >= 2) ++g_doubledFrames;
-        // Measure the TRUE base (real-frame) render rate: g_frameCount ticks once per real game
-        // frame, so d(frameCount)/d(wallclock) is the base fps. total displayed = base * multiplier
-        // (compare against PresentMon). This settles base-vs-total for the MFG pacing question.
-        static ULONGLONG s_lastTick = 0; static uint32_t s_lastFrame = 0; static float s_baseFps = 0;
-        ULONGLONG nowMs = GetTickCount64();
-        if (s_lastTick && nowMs > s_lastTick) s_baseFps = (g_frameCount - s_lastFrame) * 1000.0f / (float)(nowMs - s_lastTick);
-        if (g_frameCount <= 3 || (g_frameCount % 240) == 5) {
-            L("[FGC] f=%u baseFps=%.1f (x%dreq -> %.0f total) feedTid=%lu fgEn=%d mode=%u mult=%dx maxGen=%u status=0x%x presented=%u maxPres=%u dblFrames=%u vram=%lluMB minWH=%u render=%ux%u zNear=%.1f hudTagged=%d interpOnly=%d | wrapperLive=%d presentTid=%lu presentMarks=%ld",
-              g_frameCount, s_baseFps, g_cfg.fgMultiplier, s_baseFps * g_cfg.fgMultiplier,
-              g_feedTid, (int)g_fgEnabled, g_dlssgMode, g_cfg.fgMultiplier, g_dlssgMaxGen, (unsigned)st.status, st.numFramesActuallyPresented,
-              g_maxPresented, g_doubledFrames, (unsigned long long)(st.estimatedVRAMUsageInBytes >> 20), st.minWidthOrHeight, renderW, renderH,
-              zNear, (int)(g_lastHudTagged), (int)g_diagShowInterpOnly,
-              (int)g_wrapperLive, g_presentTid, (long)g_presentMarks);
-            s_lastTick = nowMs; s_lastFrame = g_frameCount;
-        }
+    // they are set on the presenting thread. The state query lives in presentPost().
+    g_stats.fgGameEnabled = g_fgEnabled;
+    if (g_frameCount <= 3 || (g_frameCount % 240) == 5) {
+        L("[FGC] f=%u baseFps=%.1f displayFps=%.1f feedTid=%lu fgEn=%d cfgMode=%s mult=%dx maxGen=%u dyn=%d status=0x%x presented=%u maxPres=%u dblFrames=%u vram=%lluMB render=%ux%u zNear=%.1f hudTagged=%d interpOnly=%d | hookLive=%d presentTid=%lu presentMarks=%ld",
+          g_frameCount, g_stats.baseFps, g_stats.displayFps,
+          g_feedTid, (int)g_fgEnabled, config_fg_mode_name(g_cfg.fgMode), g_cfg.fgMultiplier, g_dlssgMaxGen, (int)g_dlssgDynamicOk, g_dlssgStatus, g_lastPresented,
+          g_maxPresented, g_doubledFrames, (unsigned long long)(g_dlssgVram >> 20), renderW, renderH,
+          zNear, (int)(g_lastHudTagged), (int)g_diagShowInterpOnly,
+          (int)g_hookLive, g_presentTid, (long)g_presentMarks);
     }
 }
 
@@ -919,13 +806,31 @@ static void feedDLSSG(const void* d)
 // Returns true if DLSS-SR did the upscale (proxy then SKIPS forwarding to AMD's FSR); false to
 // fall back to FSR. Reads the FfxApi upscale desc (offsets from CONTRACT.md), runs SL DLSS on the
 // game's command list writing the upscaled result into the game's own output buffer, which the
-// downstream DLSS-G/present path then consumes. Independent viewport (vp1) + token space from FG.
+// downstream DLSS-G/present path then consumes. Independent viewport (vp1) from FG.
+static sl::DLSSMode srModeFromConfig(float ratio)
+{
+    switch (g_cfg.srQuality) {
+        case SR_DLAA:              return sl::DLSSMode::eDLAA;
+        case SR_QUALITY:           return sl::DLSSMode::eMaxQuality;
+        case SR_BALANCED:          return sl::DLSSMode::eBalanced;
+        case SR_PERFORMANCE:       return sl::DLSSMode::eMaxPerformance;
+        case SR_ULTRA_PERFORMANCE: return sl::DLSSMode::eUltraPerformance;
+        default: break;
+    }
+    // Auto: derive from the render:output ratio so any in-game FSR preset maps to the matching mode.
+    if      (ratio > 0.92f) return sl::DLSSMode::eDLAA;
+    else if (ratio > 0.62f) return sl::DLSSMode::eMaxQuality;
+    else if (ratio > 0.54f) return sl::DLSSMode::eBalanced;
+    else if (ratio > 0.45f) return sl::DLSSMode::eMaxPerformance;
+    return sl::DLSSMode::eUltraPerformance;
+}
+
 extern "C" bool slbridge_upscale(const void* d)
 {
     if (!g_slReady || !p_slGetNewFrameToken || !p_slSetConstants || !d) return false;
     static unsigned scan = 0;
-    if ((scan++ % 120) == 0) g_srDisabled = !g_cfg.dlssSR || (GetFileAttributesW(modPath(L"dlss_sr_off.flag")) != INVALID_FILE_ATTRIBUTES);
-    if (g_srDisabled) return false;
+    if ((scan++ % 120) == 0) g_srDisabled = (GetFileAttributesW(modPath(L"dlss_sr_off.flag")) != INVALID_FILE_ATTRIBUTES);
+    if (g_srDisabled || !g_cfg.dlssSR) { g_stats.srActive = false; g_stats.srMode = -1; return false; }
 
     void*    cmdList = rdPtr(d, 0x10);
     void*    colorRes= rdPtr(d, 0x18); uint32_t colorFmt=rdU32(d,0x24), colorW=rdU32(d,0x28), colorH=rdU32(d,0x2C), colorSt=rdU32(d,0x40);
@@ -945,33 +850,40 @@ extern "C" bool slbridge_upscale(const void* d)
 
     sl::ViewportHandle vp{1};
 
-    // Choose a DLSS quality preset from the render:output ratio; only re-set options on change.
+    // Choose the DLSS mode and model preset; only re-set options on change (resolution, mode, or
+    // the overlay editing the configuration).
     float ratio = (float)renderW / (float)outW;
-    sl::DLSSMode mode = sl::DLSSMode::eMaxQuality;
-    if      (ratio > 0.92f) mode = sl::DLSSMode::eDLAA;
-    else if (ratio > 0.62f) mode = sl::DLSSMode::eMaxQuality;
-    else if (ratio > 0.54f) mode = sl::DLSSMode::eBalanced;
-    else if (ratio > 0.45f) mode = sl::DLSSMode::eMaxPerformance;
-    else                    mode = sl::DLSSMode::eUltraPerformance;
-    if (outW != g_srLastOutW || outH != g_srLastOutH || (int)mode != g_srLastMode) {
-        sl::DLSSOptions o;
+    sl::DLSSMode mode = srModeFromConfig(ratio);
+    uint32_t gen = g_cfg.generation;
+    if (outW != g_srLastOutW || outH != g_srLastOutH || (int)mode != g_srLastMode || gen != g_srLastGen) {
+        sl::DLSSOptions o;   // kStructVersion3
         o.mode = mode; o.outputWidth = outW; o.outputHeight = outH;
         o.colorBuffersHDR = sl::Boolean::eTrue;   // game renders HDR10 PQ
         o.useAutoExposure = sl::Boolean::eTrue;   // no separate exposure tag needed
-        o.sharpness = 0.0f;
+        o.alphaUpscalingEnabled = sl::Boolean::eFalse;
+        sl::DLSSPreset preset = (sl::DLSSPreset)g_cfg.srPreset;
+        o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset = o.ultraQualityPreset = preset;
         sl::Result orr = p_slDLSSSetOptions(vp, o);
-        L("[SR] slDLSSSetOptions mode=%d render=%ux%u out=%ux%u ratio=%.2f -> %d (%s)", (int)mode, renderW, renderH, outW, outH, ratio, (int)orr, resStr(orr));
-        g_srLastOutW = outW; g_srLastOutH = outH; g_srLastMode = (int)mode;
+        L("[SR] slDLSSSetOptions mode=%s preset=%s render=%ux%u out=%ux%u ratio=%.2f -> %d (%s)", sl::getDLSSModeAsStr(mode), config_sr_preset_name(g_cfg.srPreset), renderW, renderH, outW, outH, ratio, (int)orr, resStr(orr));
+        g_srLastOutW = outW; g_srLastOutH = outH; g_srLastMode = (int)mode; g_srLastGen = gen;
+        g_stats.srMode = (int)mode; g_stats.srPreset = g_cfg.srPreset;
+        g_stats.renderW = renderW; g_stats.renderH = renderH; g_stats.outW = outW; g_stats.outH = outH;
     }
 
-    // Steam overlay fix (default on): DLSS-SR takes its own frame token, i.e. its own
-    // slGetNewFrameToken stream, which is what activates the Steam overlay's DLSS-G detector so it
-    // reports "DLSS" with the correct native count. This pairs with proxy.cpp removing Steam's FSR
-    // detector. With the fix off, DLSS-SR shares DLSS-G's token and Steam reports "FSR". Either way
-    // we fall back to our own token before DLSS-G has produced its first one.
+    // Frame token for the upscale. With frame-based tagging the tags live under the token's frame
+    // index, so SR uses the index DLSS-G will use for this frame (the game's next frameID): the SR
+    // tags (viewport 1) and the FG tags (viewport 0) then share one frame entry and SR never evicts
+    // a frame DLSS-G may still read. Before FG has run there is no frameID yet, so SR counts its own.
+    // In legacy mode the Steam overlay fix keeps SR on its own slGetNewFrameToken stream, which is
+    // what activates Steam's DLSS-G detector so it reports "DLSS" with the correct native count.
     sl::FrameToken* t = g_curToken;
-    if (g_cfg.steamFix || !t) {
-        uint32_t idx = ++g_srFrameIdx;
+    if (g_frameTagging || g_cfg.steamFix || !t) {
+        // Share DLSS-G's index only while DLSS-G is actually being fed (frameID advanced since the last
+        // upscale); otherwise (game FG off) count our own so constants are never set twice per index.
+        static uint32_t s_lastSeenFgFrame = 0xFFFFFFFF;
+        uint32_t idx;
+        if (g_frameTagging && g_curFrameID != 0xFFFFFFFF && g_curFrameID != s_lastSeenFgFrame) { idx = g_curFrameID + 1; s_lastSeenFgFrame = g_curFrameID; }
+        else idx = ++g_srFrameIdx;
         if (p_slGetNewFrameToken(t, &idx) != sl::Result::eOk || !t) return false;
     }
 
@@ -990,7 +902,11 @@ extern "C" bool slbridge_upscale(const void* d)
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated   = sl::Boolean::eFalse;
     c.motionVectorsJittered  = sl::Boolean::eFalse;
-    p_slSetConstants(c, *t, vp);
+    {
+        sl::Result cr = p_slSetConstants(c, *t, vp);
+        static int cErr = 0;
+        if (cr != sl::Result::eOk && cErr < 5) { ++cErr; L("[SR] slSetConstants -> %d (%s)", (int)cr, resStr(cr)); }
+    }
 
     sl::Resource inC = makeSlTex(colorRes, colorSt, colorW, colorH, colorFmt);
     sl::Resource dep = makeSlTex(depthRes, depthSt, depthW, depthH, depthFmt);
@@ -1002,13 +918,19 @@ extern "C" bool slbridge_upscale(const void* d)
     tags[1] = sl::ResourceTag(&dep, sl::kBufferTypeDepth,              sl::ResourceLifecycle::eValidUntilEvaluate, &inExt);
     tags[2] = sl::ResourceTag(&mvR, sl::kBufferTypeMotionVectors,      sl::ResourceLifecycle::eValidUntilEvaluate, &inExt);
     tags[3] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &outExt);
-    p_slSetTag(vp, tags, 4, (sl::CommandBuffer*)cmdList);
+    {
+        sl::Result tr = setTags(t, vp, tags, 4, cmdList);
+        static int tErr = 0;
+        if (tr != sl::Result::eOk && tErr < 5) { ++tErr; L("[SR] tag -> %d (%s)", (int)tr, resStr(tr)); }
+    }
 
     const sl::BaseStructure* inputs[] = { (const sl::BaseStructure*)&vp };
     sl::Result er = p_slEvaluateFeature(sl::kFeatureDLSS, *t, inputs, 1, (sl::CommandBuffer*)cmdList);
     static int okLog = 0, errLog = 0;
     if (er == sl::Result::eOk) { if (okLog < 1) { ++okLog; L("[SR] DLSS upscale ACTIVE (render %ux%u -> %ux%u)", renderW, renderH, outW, outH); } }
     else if (errLog < 8)       { ++errLog; L("[SR] slEvaluateFeature(DLSS) -> %d (%s); falling back to FSR", (int)er, resStr(er)); }
+    g_stats.srActive = (er == sl::Result::eOk);
+    if (!g_stats.srActive) g_stats.srMode = -1;
     return er == sl::Result::eOk;
 }
 
@@ -1026,6 +948,7 @@ extern "C" uint32_t slbridge_configure(void* handle, const void* descV)
         g_hudless.height = rdU32(descV, 0x54);
         g_hudless.state  = rdU32(descV, 0x68);
         g_frameID        = rdU64(descV, 0x88);
+        g_stats.fgGameEnabled = g_fgEnabled;
         static int cfgLog = 0;
         if (cfgLog < 3 || wasEnabled != g_fgEnabled) {
             ++cfgLog;
@@ -1071,16 +994,19 @@ extern "C" uint32_t slbridge_dispatch(void* handle, const void* descV)
     if (h && h->type == T_FG_PREPARE) feedDLSSG(descV);
 
     if (h && h->type == T_FG_DISPATCH) {
-        // (a) Set the swapchain color space once from the backbuffer transfer function.
+        // (a) Set the swapchain color space once from the backbuffer transfer function, and tell the
+        //     overlay how to encode its pixels.
         if (!g_csSet && g_scCtx && g_scCtx->sc4) {
             uint32_t tf = rdU32(descV, 0x110);
             float lumMin = rdF32(descV, 0x114), lumMax = rdF32(descV, 0x118);
             DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-            if      (tf == 1) cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-            else if (tf == 2) cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            int ovlMode = 0;
+            if      (tf == 1) { cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020; ovlMode = 1; }
+            else if (tf == 2) { cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;    ovlMode = 2; }
             HRESULT hr = g_scCtx->sc4->SetColorSpace1(cs);
             L("[CS] backbufferTransferFunction=%u lum=[%.4f,%.1f] -> SetColorSpace1(%d) hr=0x%08lx",
               tf, lumMin, lumMax, (int)cs, (unsigned long)hr);
+            overlay_set_colorspace(ovlMode);
             g_csSet = true;
         }
         // (b) Optional HUDLessColor + UIColorAndAlpha tags (fsr2dlss.ini HudlessTags=true).
@@ -1105,7 +1031,7 @@ extern "C" uint32_t slbridge_dispatch(void* handle, const void* descV)
                     tags[nt++] = sl::ResourceTag(&ui, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &uiExt);
                 }
                 sl::ViewportHandle vp{0};
-                sl::Result tr = p_slSetTag(vp, tags, nt, (sl::CommandBuffer*)cmdList);
+                sl::Result tr = setTags(g_curToken, vp, tags, (uint32_t)nt, cmdList);
                 g_lastHudTagged = (tr == sl::Result::eOk);
             }
         }
@@ -1119,6 +1045,10 @@ extern "C" void slbridge_destroy(void* handle)
     if (!c || c->magic != CTX_MAGIC) return;
     L("[BR] destroy ctx=%p kind=%d", (void*)c, (int)c->kind);
     unregisterCtx(c);
+    if (c->kind == CTX_SWAPCHAIN) {
+        overlay_shutdown();
+        if (g_scCtx == c) { g_scCtx = nullptr; g_csSet = false; g_curToken = nullptr; }
+    }
     if (c->dummyList)  c->dummyList->Release();
     if (c->dummyAlloc) c->dummyAlloc->Release();
     if (c->dummyTex)   c->dummyTex->Release();
@@ -1126,24 +1056,4 @@ extern "C" void slbridge_destroy(void* handle)
     if (c->sc4)        c->sc4->Release();
     c->magic = 0;
     delete c;
-}
-
-static const char* resStr(sl::Result r)
-{
-    switch (r) {
-        case sl::Result::eOk: return "eOk";
-        case sl::Result::eErrorDriverOutOfDate: return "eErrorDriverOutOfDate";
-        case sl::Result::eErrorOSOutOfDate: return "eErrorOSOutOfDate";
-        case sl::Result::eErrorOSDisabledHWS: return "eErrorOSDisabledHWS";
-        case sl::Result::eErrorNoSupportedAdapterFound: return "eErrorNoSupportedAdapterFound";
-        case sl::Result::eErrorAdapterNotSupported: return "eErrorAdapterNotSupported";
-        case sl::Result::eErrorMissingProxy: return "eErrorMissingProxy";
-        case sl::Result::eErrorNotInitialized: return "eErrorNotInitialized";
-        case sl::Result::eErrorFeatureNotSupported: return "eErrorFeatureNotSupported";
-        case sl::Result::eErrorFeatureMissing: return "eErrorFeatureMissing";
-        case sl::Result::eErrorInvalidParameter: return "eErrorInvalidParameter";
-        case sl::Result::eErrorUnsupportedInterface: return "eErrorUnsupportedInterface";
-        case sl::Result::eErrorMissingInputParameter: return "eErrorMissingInputParameter";
-        default: return "eError(other)";
-    }
 }

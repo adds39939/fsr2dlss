@@ -1,6 +1,24 @@
-# Streamline 2.2.0 DLSS-G integration spec (for the FfxApi proxy) - condensed
+# Streamline DLSS-G integration spec (for the FfxApi proxy) - condensed
 
-COMPILE AGAINST the Streamline 2.2 headers in third_party/sl2.2. 2.12 differs (no sl.pcl at 2.2; markers via sl.reflex).
+## Streamline 2.14 (current build) - what changed from the notes below
+- COMPILE AGAINST third_party/streamline/include (SDK 2.14.16). Runtime: sl.* 2.14.16 + nvngx 310.9.16 from the
+  same SDK zip (pinned in third_party/streamline/SDK_VERSION). slInit is given sl::kSDKVersion.
+- Tagging is frame-based: Preferences.flags |= eUseFrameBasedResourceTagging and slSetTagForFrame(frame, vp, ...).
+  slSetTag is deprecated and ERRORS when the flag is set (sl.common refuses mixing). Tags live in a 32-entry ring
+  keyed by frame index; sl.cpp's slGetNewFrameToken reuses the handle when asked for the same index twice, so SR
+  (viewport 1) requests the index DLSS-G will use for the frame (game frameID + 1) and shares the entry.
+  Compat LegacyTagging=true restores the old path (slSetTag + host 2.7.4).
+- Markers: sl.pcl only (sl::PCLMarker, slPCLSetMarker). slReflexSetMarker is gone from the headers.
+- DLSSGOptions is kStructVersion5 in the header (numFramesToGenerate, queueParallelismMode, enableUserInterfaceRecomposition,
+  dynamicTargetFrameRate); DLSSGMode has eAuto and eDynamic (Dynamic MFG, check DLSSGState::bIsDynamicMFGSupported).
+  DLSSGState is kStructVersion4 (numFramesToGenerateMax, bIsVsyncSupportAvailable, inputs fence, bIsDynamicMFGSupported).
+- DLSSOptions is kStructVersion3: per-mode DLSSPreset fields (presets J, K, L, M live; A-D removed; E/F deprecated;
+  G/H/I/N/O revert to default), useAutoExposure, alphaUpscalingEnabled. sharpness is deprecated.
+- Do NOT set eDisableCLStateTracking: DLSS SR is evaluated on the game's command list mid-frame.
+
+## Original 2.2-era notes (still describe the integration shape)
+
+(Written against the 2.2 headers, which lived in third_party/sl2.2; see the 2.14 section above for what moved.)
 Feature ids: kFeatureDLSS=0, kFeatureNIS=2, kFeatureReflex=3, kFeatureDLSS_G=1000.
 Functions are C exports of sl.interposer.dll; feature funcs (slDLSSGSetOptions, slReflexSetMarker...) NOT exports -
 resolve via slGetFeatureFunction AFTER slSetD3DDevice. Use PFun_* typedefs from headers for GetProcAddress.

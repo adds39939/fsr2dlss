@@ -1,37 +1,38 @@
 # Installing fsr2dlss
 
-This replaces Lies of P's FSR 3.1 upscaling and frame generation with NVIDIA DLSS and DLSS-G. It has
-been tested on Lies of P on an RTX 5090. Other FSR 3.1 games that use the same FidelityFX API might
-work but are untested.
+This replaces Lies of P's FSR 3.1 upscaling and frame generation with NVIDIA DLSS Super Resolution and
+DLSS Multi-Frame Generation. It has been tested on Lies of P on an RTX 5090. Other FSR 3.1 games that
+use the same FidelityFX API might work but are untested.
 
 This is an unofficial mod that swaps a game DLL. Back up the original first and expect to update it as
 the game and drivers change.
 
 ## 1. Requirements
 
-- An RTX 50-series GPU. Frame generation needs one, and 3x/4x Multi-Frame Generation is 50-series only.
-- A recent NVIDIA driver.
+- An RTX 40- or 50-series GPU. 3x/4x Multi-Frame Generation and Dynamic MFG need a 50-series card.
+- A recent NVIDIA driver (the bundled Streamline 2.14 / DLSS 310.9 need a 2025 or newer driver).
 - Hardware-Accelerated GPU Scheduling turned on: Windows Settings, System, Display, Graphics, Default
   graphics settings. Reboot after changing it.
 - Windows 10 or 11, DirectX 12, and a copy of Lies of P.
 
 ## 2. Get the files
 
-**The mod.** Download the `fsr2dlss` artifact from the repo's GitHub Actions build. It contains the
-proxy `amd_fidelityfx_dx12.dll`, a sample `fsr2dlss.ini`, and a `streamline\` folder with the
-Streamline plugins (`sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`, `sl.dlss_g.dll`,
-`sl.pcl.dll`, `sl.reflex.dll`). Streamline is MIT-licensed, so those ship with the mod. You can also
-build the proxy yourself; see ARCHITECTURE.md.
+Download the newest `fsr2dlss-vX.Y.Z.zip` from the repo's **Releases** page and unzip it. It contains
+everything:
 
-**The two NGX models.** DLSS runs from two NVIDIA NGX DLLs that are proprietary and cannot be bundled.
-Download them from TechPowerUp and drop them into the `streamline\` folder alongside the Streamline
-plugins:
+```
+amd_fidelityfx_dx12.dll     the mod (proxy)
+fsr2dlss.ini                configuration (defaults are fine)
+INSTALL.md                  this file
+VERSIONS.txt                exact versions of the bundled DLLs
+licenses\                   Streamline, DLSS, Reflex, Dear ImGui, MinHook license texts
+streamline\
+  sl.interposer.dll  sl.common.dll  sl.dlss.dll  sl.dlss_g.dll  sl.pcl.dll  sl.reflex.dll
+  nvngx_dlss.dll     nvngx_dlssg.dll
+```
 
-- `nvngx_dlss.dll` (super-resolution): https://www.techpowerup.com/download/nvidia-dlss-dll/
-- `nvngx_dlssg.dll` (frame generation): https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/
-
-Use version **310.1.0** of each; a newer 310.x build should also work. TechPowerUp lets you pick the
-version from a dropdown, then gives you the DLL to copy into `streamline\`.
+Nothing has to be downloaded separately: the Streamline plugins and the DLSS / DLSS-G model DLLs are
+bundled. You can also build the proxy yourself; see ARCHITECTURE.md.
 
 ## 3. Install
 
@@ -40,9 +41,8 @@ Let `WIN64` be `...\steamapps\common\Lies of P\LiesofP\Binaries\Win64`, the fold
 
 1. Back up `WIN64\amd_fidelityfx_dx12.dll` (the real one, about 6.6 MB) and rename it to
    `amd_fidelityfx_dx12.amd.dll`. The proxy forwards to it.
-2. Copy the proxy `amd_fidelityfx_dx12.dll` from the artifact into `WIN64`.
-3. Copy the artifact's `streamline\` folder into `WIN64`, then add `nvngx_dlss.dll` and
-   `nvngx_dlssg.dll` from step 2 to it.
+2. Copy the zip's `amd_fidelityfx_dx12.dll` into `WIN64`.
+3. Copy the zip's `streamline\` folder into `WIN64`.
 4. Copy `fsr2dlss.ini` into `WIN64`.
 
 The final layout:
@@ -57,46 +57,82 @@ WIN64\
     sl.pcl.dll         sl.reflex.dll  nvngx_dlss.dll  nvngx_dlssg.dll
 ```
 
+Updating: overwrite `amd_fidelityfx_dx12.dll` and the `streamline\` folder with the new zip's. Keep
+your `fsr2dlss.ini` if you have customised it (new keys fall back to defaults).
+
 ## 4. In-game settings
 
 In the graphics options set Upscaling / Super Resolution to FSR (any preset) and turn Frame
 Generation on. The mod swaps FSR for DLSS underneath and picks the matching DLSS quality mode from the
-preset you chose. The game still shows FSR in its menu; that is expected.
+preset you chose. The game still shows FSR in its menu; that is expected. The mod's frame-generation
+swapchain (and therefore the overlay) only exists while the game's Frame Generation is on.
 
-## 5. Configure fsr2dlss.ini
+## 5. The overlay (Home key)
 
-The file sits next to `amd_fidelityfx_dx12.dll`.
+Press **Home** in game to open the configuration overlay (the key is `ToggleKey` in `fsr2dlss.ini`).
+While it is open the mouse and keyboard go to the overlay, not the game. Press Home again or click
+Close to return. Changes apply immediately; **Save to fsr2dlss.ini** writes them to disk for the next
+start.
 
-| Setting | Values | Notes |
+- **DLSS Super Resolution**: enable/disable DLSS (off = the game's FSR), the DLSS quality mode (Auto
+  follows the in-game FSR preset), and the DLSS model preset (Default, K, J, L, M, or the legacy E/F).
+- **DLSS Frame Generation**: the preset (Off, Fixed multiplier, Dynamic Multi-Frame Generation), the
+  multiplier (2x, 3x, 4x, clamped to what the card reports), the Dynamic target fps, and flip metering
+  (hardware/software, applied at the next start).
+- **Overlay**: the FPS counter on/off and its corner, UI scale, HDR brightness, and the Steam overlay
+  fix.
+
+The FPS counter (on by default, top-right) shows `<displayed> fps | base <rendered> | 3x`: the
+framerate reaching your display, the framerate the game actually renders, and the multiplier in
+effect. With frame generation off it shows the plain framerate.
+
+## 6. Configure fsr2dlss.ini
+
+The file sits next to `amd_fidelityfx_dx12.dll`. Everything in it can also be changed from the overlay.
+
+| Section / key | Values | Notes |
 |---|---|---|
-| `Multiplier` | `2`, `3`, `4` | Frame-gen multiplier. Clamped to the card's maximum. |
-| `FlipMetering` | `hardware`, `software` | `hardware` gives true 3x/4x MFG. `software` is clean 2x. |
-| `DLSS` | `true`, `false` | DLSS upscaling on, or pass through to FSR. |
-| `SteamOverlayFix` | `true`, `false` | Make the Steam overlay report DLSS with correct counts. |
-| `HudlessTags` | `false` | Experimental. Leave off for this game. |
-| `Debug` | `false` | Write `ffx_bridge.log`. Leave off unless troubleshooting. |
+| `[FrameGen] Mode` | `fixed`, `dynamic`, `off` | FG preset. `dynamic` needs card/driver support for Dynamic MFG and falls back to fixed otherwise. |
+| `[FrameGen] Multiplier` | `2`, `3`, `4` | Fixed multiplier. Clamped to the card's maximum. |
+| `[FrameGen] DynamicTargetFps` | number | Target for `dynamic`; `0` = display refresh rate. |
+| `[FrameGen] FlipMetering` | `hardware`, `software` | `hardware` gives true 3x/4x MFG. `software` is clean 2x. Restart to apply. |
+| `[Upscaling] DLSS` | `true`, `false` | DLSS upscaling on, or pass through to FSR. |
+| `[Upscaling] Quality` | `auto`, `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | DLSS mode; `auto` follows the in-game FSR preset. |
+| `[Upscaling] Preset` | `default`, `K`, `J`, `L`, `M`, `E`, `F` | DLSS model preset (DLSS 310 letters). |
+| `[Overlay] SteamOverlayFix` | `true`, `false` | Make the Steam overlay report DLSS with correct counts. |
+| `[Overlay] Enabled`, `ToggleKey` | `true`/`false`, key name | Overlay availability and key (`Home`, `F10`, `Insert`, `0x24`, ...). |
+| `[Overlay] ShowFps`, `FpsCorner` | `true`/`false`, `0`-`3` | FPS counter and its corner (0 TL, 1 TR, 2 BL, 3 BR). |
+| `[Overlay] Scale`, `BrightnessNits` | `0.5`-`3.0`, `50`-`1000` | UI scale; paper white on HDR displays. |
+| `[HUD] HudlessTags` | `false` | Experimental. Leave off for this game. |
+| `[Logging] Debug` | `false` | Write `ffx_bridge.log`. Leave off unless troubleshooting. |
+| `[Compat] LegacyTagging` | `false` | Troubleshooting: use the pre-2.14 Streamline tagging path. |
 
-## 6. Verify it is working
+## 7. Verify it is working
 
-- The framerate roughly triples with Frame Generation on, and the image looks cleaner than FSR.
+- The FPS counter shows a displayed framerate well above the base framerate and the multiplier.
 - The Steam overlay shows DLSS with a native and a generated frame count.
 - For a definitive check, run `src\fg_overlay.ps1` as administrator once to enable NVIDIA's on-screen
   DLSS and DLSS-G indicators, then relaunch. Remove them later with `fg_overlay.ps1 -Off`.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
-Turn on logging first: set `Debug = true` in `fsr2dlss.ini`, relaunch, and read `WIN64\ffx_bridge.log`
-and `WIN64\streamline\sl.log`.
+Turn on logging first: set `Debug = true` in `fsr2dlss.ini` (or in the overlay, then Save), relaunch,
+and read `WIN64\ffx_bridge.log` and `WIN64\streamline\sl.log`.
 
 - **Crash on launch.** Usually the `streamline\` folder is incomplete. Make sure all six Streamline
   plugins and both `nvngx_*.dll` models are present, and that the original DLL was renamed to
   `amd_fidelityfx_dx12.amd.dll`.
 - **Image looks like FSR, not DLSS.** The super-resolution plugin is not loading. Check that
   `sl.dlss.dll` and `nvngx_dlss.dll` are in `streamline\`; the log should print `[SR] DLSS upscale ACTIVE`.
-- **Wrong colors.** A model mismatch. Use `nvngx` version 310.1.0 with the bundled Streamline plugins.
 - **Frame generation not multiplying.** Confirm HAGS is on and that in-game Frame Generation is on.
+  The overlay's status line prints DLSS-G's status flags if Streamline reports a problem.
+- **Driver too old.** `sl.log` says so explicitly; update the NVIDIA driver.
+- **Something that worked with an older fsr2dlss broke.** Set `[Compat] LegacyTagging = true`, which
+  restores the old Streamline tagging path, and report what you see.
+- **Overlay does not open.** It only exists while the game's Frame Generation is on. Check
+  `ToggleKey`, and that the game window has focus.
 
-## 8. Uninstall
+## 9. Uninstall
 
 Delete `amd_fidelityfx_dx12.dll`, rename `amd_fidelityfx_dx12.amd.dll` back to
 `amd_fidelityfx_dx12.dll`, and remove `streamline\`, `fsr2dlss.ini`, and any `ffx_bridge.log`.

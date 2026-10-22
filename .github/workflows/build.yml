@@ -1,12 +1,14 @@
 name: Build
 
+# Builds the proxy DLL with MinGW-w64 and assembles the install package (proxy + ini + INSTALL.md +
+# streamline/ with the pinned Streamline plugins and DLSS models) as the `fsr2dlss` artifact.
+# Runs on pull requests, on demand, and as the build stage of release.yml (workflow_call).
+
 on:
-  push:
-    branches: [ main ]
-    paths: [ 'src/**', 'third_party/**', '.github/workflows/build.yml' ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build:
@@ -24,41 +26,27 @@ jobs:
           update: true
           install: >-
             git
+            unzip
             mingw-w64-x86_64-gcc
 
-      - name: Fetch MinHook (MIT)
-        run: git clone --depth 1 https://github.com/TsudaKageyu/minhook.git minhook_src
+      - name: Cache third-party downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/streamline-sdk-*.zip
+          key: streamline-${{ hashFiles('third_party/streamline/SDK_VERSION') }}
 
-      - name: Compile MinHook
-        run: |
-          mkdir -p mh_obj
-          for f in buffer hook trampoline; do
-            gcc -c -O2 -I minhook_src/include -I minhook_src/src "minhook_src/src/$f.c" -o "mh_obj/$f.o"
-          done
-          for f in hde32 hde64; do
-            gcc -c -O2 -I minhook_src/include -I minhook_src/src "minhook_src/src/hde/$f.c" -o "mh_obj/$f.o"
-          done
+      - name: Fetch dependencies (MinHook, Dear ImGui, Streamline SDK)
+        run: src/fetch_deps.sh
 
-      - name: Build proxy DLL
-        run: |
-          g++ -O2 -std=c++17 -shared -static -static-libgcc -static-libstdc++ \
-            -I third_party/sl2.2 -I minhook_src/include \
-            -o amd_fidelityfx_dx12.dll \
-            src/proxy.cpp src/slbridge.cpp src/nvhook.cpp \
-            mh_obj/buffer.o mh_obj/hook.o mh_obj/trampoline.o mh_obj/hde32.o mh_obj/hde64.o \
-            src/exports.def -lkernel32 -luser32
-          ls -la amd_fidelityfx_dx12.dll
+      - name: Build and package
+        run: src/build.sh
 
-      - name: Package
+      - name: Check exports
         run: |
-          mkdir -p dist/streamline
-          cp amd_fidelityfx_dx12.dll dist/
-          cp fsr2dlss.ini.example dist/fsr2dlss.ini
-          cp docs/INSTALL.md dist/
-          # Bundle the Streamline plugins (MIT). The nvngx NGX models are proprietary and are
-          # not included; users download them from TechPowerUp (see INSTALL.md).
-          cp runtime/streamline/sl.*.dll dist/streamline/
-          ls -R dist
+          objdump -p build/amd_fidelityfx_dx12.dll | grep -E '^\s+\[\s*[0-9]+\]' | awk '{print $2}' | sort > exports.txt
+          cat exports.txt
+          for e in ffxCreateContext ffxDestroyContext ffxConfigure ffxQuery ffxDispatch; do grep -qx "$e" exports.txt || { echo "missing export $e"; exit 1; }; done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

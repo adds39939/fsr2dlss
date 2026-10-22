@@ -4,6 +4,26 @@
 #pragma once
 #include <cstdint>
 
+// Live counters the bridge keeps for the in-game overlay. Written on the render/present
+// thread, read by the overlay on the present thread; plain fields, no locking needed.
+struct BridgeStats {
+    float    baseFps        = 0;    // real (game-rendered) frames per second
+    float    displayFps     = 0;    // frames reaching the display per second (base x multiplier)
+    uint32_t fgApplied      = 0;    // 0 = DLSS-G off, 1 = dynamic, N>=2 = fixed Nx
+    uint32_t fgMaxGen       = 1;    // numFramesToGenerateMax reported by the card (1 = 2x only)
+    bool     fgDynamicOk    = false;// card reports Dynamic Multi Frame Generation support
+    bool     fgGameEnabled  = false;// the game has frame generation turned on
+    uint32_t fgStatus       = 0;    // sl::DLSSGStatus bits (0 = ok)
+    uint64_t fgVramBytes    = 0;
+    int      srMode         = -1;   // sl::DLSSMode in use, -1 = DLSS super-resolution not running
+    int      srPreset       = 0;    // sl::DLSSPreset in use
+    uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
+    bool     srActive       = false;// last upscale ran through DLSS
+    bool     frameTagging   = false;// using slSetTagForFrame (false = legacy slSetTag)
+    uint32_t slVersion[3]   = {0,0,0};
+};
+extern BridgeStats g_stats;
+
 extern "C" {
 
 // One-time Streamline init (manual hooking) against the game's existing device.

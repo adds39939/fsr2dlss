@@ -1,0 +1,88 @@
+name: Release
+
+# Every push to main (i.e. every merge) builds the mod and publishes a GitHub Release with a ready-to-
+# install zip: the proxy DLL, fsr2dlss.ini, INSTALL.md, and streamline/ with the Streamline plugins
+# and the DLSS / DLSS-G model DLLs. Tag: v<VERSION file>.<run number>, e.g. v1.0.42.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: fsr2dlss
+          path: dist
+
+      - name: Compose version
+        id: ver
+        run: |
+          BASE="$(tr -d '[:space:]' < VERSION)"
+          TAG="v${BASE}.${{ github.run_number }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "zip=fsr2dlss-${TAG}.zip" >> "$GITHUB_OUTPUT"
+          echo "Release $TAG"
+
+      - name: Zip package
+        run: |
+          cd dist
+          zip -r -9 "../${{ steps.ver.outputs.zip }}" .
+          cd ..
+          sha256sum "${{ steps.ver.outputs.zip }}" | tee "${{ steps.ver.outputs.zip }}.sha256"
+          ls -la
+
+      - name: Write release notes
+        run: |
+          SL="$(sed -n 1p third_party/streamline/SDK_VERSION | tr -d '[:space:]')"
+          DLSS="$(grep '^nvngx_dlss.dll=' dist/VERSIONS.txt | cut -d= -f2)"
+          DLSSG="$(grep '^nvngx_dlssg.dll=' dist/VERSIONS.txt | cut -d= -f2)"
+          {
+            echo "fsr2dlss ${{ steps.ver.outputs.tag }} — built from ${GITHUB_SHA::7}."
+            echo
+            echo "**Download \`${{ steps.ver.outputs.zip }}\`, unzip, and follow \`INSTALL.md\` (also in [docs/INSTALL.md](https://github.com/${{ github.repository }}/blob/${GITHUB_SHA}/docs/INSTALL.md)).**"
+            echo
+            echo "| Component | Version |"
+            echo "|---|---|"
+            echo "| NVIDIA Streamline plugins (sl.interposer, sl.common, sl.dlss, sl.dlss_g, sl.pcl, sl.reflex) | ${SL} |"
+            echo "| DLSS Super Resolution model (nvngx_dlss.dll) | ${DLSS:-see VERSIONS.txt} |"
+            echo "| DLSS Frame Generation model (nvngx_dlssg.dll) | ${DLSSG:-see VERSIONS.txt} |"
+            echo
+            echo "Package contents:"
+            echo '```'
+            (cd dist && find . -type f | sort)
+            echo '```'
+            echo
+            echo "Press **Home** in game to open the configuration overlay (DLSS preset and quality mode, frame-generation preset and multiplier, FPS counter)."
+            echo
+            echo "Streamline, Dear ImGui and MinHook are MIT licensed; the \`nvngx_*\` DLSS models are redistributed under the NVIDIA RTX SDKs license (see \`licenses/\`)."
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "${{ steps.ver.outputs.zip }}" "${{ steps.ver.outputs.zip }}.sha256" \
+            --repo "${{ github.repository }}" \
+            --target "${GITHUB_SHA}" \
+            --title "fsr2dlss ${{ steps.ver.outputs.tag }}" \
+            --notes-file notes.md
