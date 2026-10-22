@@ -15,6 +15,11 @@
 #include <cstdarg>
 #include <cstring>
 #include "slbridge.h"
+#include "config.h"
+#include "status.h"
+#include "dxgihook.h"
+
+ModStatus g_status;
 
 // ---- minimal, version-stable FfxApi surface (header is ABI-frozen) ---------
 typedef uint32_t ffxReturnCode_t;
@@ -51,28 +56,6 @@ static void selfDir(wchar_t* out, size_t cch)
 }
 
 static bool g_logEnabled = false;   // fsr2dlss.ini [Logging] Debug=true; off by default (no log file)
-
-// Minimal INI read (proxy logs before slbridge's full config parser runs). Returns the boolean
-// value of the given key in fsr2dlss.ini, or `def` if the key/file is absent.
-static bool iniBool(const char* wantKey, bool def)
-{
-    wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
-    wcsncat(path, L"fsr2dlss.ini", MAX_PATH - wcslen(path) - 1);
-    FILE* f = _wfopen(path, L"rb"); if (!f) return def;
-    char line[256]; bool val = def;
-    while (fgets(line, sizeof(line), f)) {
-        char* c = strpbrk(line, ";#"); if (c) *c = 0;
-        char* eq = strchr(line, '='); if (!eq) continue;
-        *eq = 0;
-        char* key = line; while (*key == ' ' || *key == '\t') ++key;
-        char* ke = key + strlen(key); while (ke > key && (ke[-1]==' '||ke[-1]=='\t'||ke[-1]=='\r'||ke[-1]=='\n')) *--ke = 0;
-        if (_stricmp(key, wantKey) != 0) continue;
-        char* v = eq + 1; while (*v == ' ' || *v == '\t') ++v;
-        val = (!_strnicmp(v,"true",4) || !_strnicmp(v,"on",2) || !_strnicmp(v,"yes",3) || v[0]=='1');
-    }
-    fclose(f);
-    return val;
-}
 
 static void logRaw(const char* s)
 {
@@ -236,16 +219,28 @@ static bool ensureSL(const ffxApiHeader* desc)
     }
     wchar_t dir[MAX_PATH]; selfDir(dir, MAX_PATH);
     wcsncat(dir, L"streamline", MAX_PATH - wcslen(dir) - 1);
+    g_status.slState = SL_TRYING;
     bool ok = slbridge_init(dev, dir);
     InterlockedExchange(&g_slState, ok ? 2 : 3);
+    g_status.slState = ok ? SL_READY : SL_FAILED;
     return ok;
 }
 
 // ---- lazy init of the real DLL --------------------------------------------
+// Load fsr2dlss.ini and switch the log on if Debug=true. Called from the first FfxApi call and from
+// the DXGI hook thread, whichever comes first.
+extern "C" void proxy_init_logging()
+{
+    static volatile LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    if (!g_lockInit) { InitializeCriticalSection(&g_loglock); g_lockInit = true; }
+    config_load();                      // fsr2dlss.ini (shared with the bridge and the overlay)
+    g_logEnabled = g_cfg.debug;         // opt-in file logging ([Logging] Debug=true)
+}
+
 static void doInit()
 {
-    if (!g_lockInit) { InitializeCriticalSection(&g_loglock); g_lockInit = true; }
-    g_logEnabled = iniBool("Debug", false);   // opt-in file logging (fsr2dlss.ini [Logging] Debug=true)
+    proxy_init_logging();
     wchar_t path[MAX_PATH]; selfDir(path, MAX_PATH);
     wcsncat(path, REAL_DLL, MAX_PATH - wcslen(path) - 1);
     g_real = LoadLibraryW(path);
@@ -259,6 +254,7 @@ static void doInit()
     r_configure = (PfnConfigure)GetProcAddress(g_real, "ffxConfigure");
     r_query     = (PfnQuery)    GetProcAddress(g_real, "ffxQuery");
     r_dispatch  = (PfnDispatch) GetProcAddress(g_real, "ffxDispatch");
+    g_status.realDllLoaded = r_create && r_destroy && r_configure && r_query && r_dispatch;
     logf("loaded real DLL '%ls'  create=%p destroy=%p configure=%p query=%p dispatch=%p\n",
          path, (void*)r_create, (void*)r_destroy, (void*)r_configure, (void*)r_query, (void*)r_dispatch);
 }
@@ -285,6 +281,10 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxA
 {
     ensure();
     uint64_t t = peekType(desc);
+    ++g_status.ffxCalls;
+    if (t == 0x00010000)        g_status.upscaleContext = true;
+    else if (t == T_FRAMEGEN_CREATE) g_status.fgContext = true;
+    else if (t == T_SWAPCHAIN_NEW)   g_status.fgSwapchainContext = true;
     if (bump(0, t) <= LOG_CAP) {
         logf("\n>>> ffxCreateContext(context=%p, desc=%p, memCb=%p)\n", (void*)context, (void*)desc, (void*)memCb);
         if (desc) logChain("CreateContext", desc, DUMP_SZ);
@@ -313,6 +313,7 @@ __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxA
 __declspec(dllexport) ffxReturnCode_t ffxDestroyContext(ffxContext* context, const ffxAllocationCallbacks* memCb)
 {
     ensure();
+    ++g_status.ffxCalls;
     void* h = derefCtx(context);
     if (slbridge_is_mine(h)) { logf(">>> ffxDestroyContext(MINE %p)\n", h); slbridge_destroy(h); return 0; }
     return r_destroy ? r_destroy(context, memCb) : 1;
@@ -321,6 +322,10 @@ __declspec(dllexport) ffxReturnCode_t ffxDestroyContext(ffxContext* context, con
 __declspec(dllexport) ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxApiHeader* desc)
 {
     ensure();
+    ++g_status.ffxCalls;
+    // FRAMEGEN configure (0x00020002) carries the game's frame-generation toggle at +0x38; record it
+    // here so the status panel is right even when the context is AMD's (Streamline not ready).
+    if (peekType(desc) == 0x00020002 && readable(desc, 0x39)) g_status.gameFgEnabled = *((const unsigned char*)desc + 0x38) != 0;
     void* h = derefCtx(context);
     if (slbridge_is_mine(h)) return slbridge_configure(h, desc);
     if (bump(2, peekType(desc)) <= LOG_CAP) {
@@ -333,6 +338,7 @@ __declspec(dllexport) ffxReturnCode_t ffxConfigure(ffxContext* context, const ff
 __declspec(dllexport) ffxReturnCode_t ffxQuery(ffxContext* context, ffxApiHeader* desc)
 {
     ensure();
+    ++g_status.ffxCalls;
     void* h = derefCtx(context);
     if (slbridge_is_mine(h)) return slbridge_query(h, desc);
     bool full = bump(3, peekType(desc)) <= LOG_CAP;
@@ -349,6 +355,9 @@ __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffx
 {
     ensure();
     uint64_t dt = peekType(desc);
+    ++g_status.ffxCalls;
+    if (dt == 0x00010001) { ++g_status.upscaleDispatches; g_status.lastUpscaleTick = GetTickCount64(); }
+    else if (dt == 0x00020003) ++g_status.fgDispatches;
     // The UPSCALE dispatch (0x00010001) is the first FfxApi call of each frame. Handle it FIRST,
     // before is_mine routing, so it always runs through DLSS-SR even when the upscale context is
     // ours (stubbed). Open the injected Reflex frame, then try DLSS: if it runs, SKIP AMD's FSR;
@@ -382,9 +391,8 @@ static bool          g_cfgSaved = false;
 // overlay reports DLSS (paired with slbridge's own-SR-frame-token to activate Steam's DLSS-G detector).
 static bool steamFixOn()
 {
-    static int cached = -1;
-    if (cached < 0) cached = iniBool("SteamOverlayFix", true) ? 1 : 0;
-    return cached != 0;
+    config_load();
+    return g_cfg.steamFix;   // live: the overlay can toggle it
 }
 static void restoreFfxConfigure()
 {
@@ -395,6 +403,7 @@ static void restoreFfxConfigure()
         memcpy(g_cfgAddr, g_cfgClean, sizeof(g_cfgClean));
         VirtualProtect(g_cfgAddr, sizeof(g_cfgClean), old, &old);
         FlushInstructionCache(GetCurrentProcess(), g_cfgAddr, sizeof(g_cfgClean));
+        ++g_status.steamUnhooks;
         logf("[UNHOOK] removed Steam's inline hook on ffxConfigure (FSR-FG detection suppressed)\n");
     }
 }
@@ -416,6 +425,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         // Save our clean ffxConfigure prologue NOW (before Steam gets a chance to hook it).
         g_cfgAddr = (void*)GetProcAddress(inst, "ffxConfigure");
         if (g_cfgAddr) { memcpy(g_cfgClean, g_cfgAddr, sizeof(g_cfgClean)); g_cfgSaved = true; }
+        // Hook the game's own swapchain from a worker thread so the overlay exists even before (or
+        // without) any FidelityFX call. Nothing heavy happens on the loader lock.
+        dxgihook_start();
     }
     return TRUE;
 }

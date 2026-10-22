@@ -6,6 +6,7 @@
 #include "sl_consts.h"
 #include "sl_dlss_g.h"
 #include "sl_reflex.h"
+#include "sl_pcl.h"
 
 int probe()
 {
@@ -26,7 +27,7 @@ int probe()
     PFun_slSetD3DDevice* pDev = nullptr;
     PFun_slIsFeatureSupported* pSup = nullptr;
     PFun_slDLSSGSetOptions* pOpt = nullptr;
-    PFun_slReflexSetMarker* pMark = nullptr;
+    PFun_slPCLSetMarker* pMark = nullptr;
     (void)pInit;(void)pDev;(void)pSup;(void)pOpt;(void)pMark;(void)vp;(void)ai;(void)c;(void)opt;(void)ro;
     return (int)sizeof(sl::Preferences) + (int)sizeof(sl::Constants) + (int)sizeof(sl::DLSSGOptions);
 }

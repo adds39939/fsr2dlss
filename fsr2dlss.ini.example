@@ -1,34 +1,75 @@
 ; fsr2dlss configuration. Rename to fsr2dlss.ini and place it next to amd_fidelityfx_dx12.dll
-; (the game's Win64 folder). Lines starting with ; or # are comments. Read once at startup.
+; (the game's Win64 folder). Lines starting with ; or # are comments. Read once at startup; the
+; in-game overlay (press the ToggleKey, Home by default) edits these values live and rewrites this
+; file when you click Save.
 
 [FrameGen]
+; Frame-generation mode:
+;   fixed   = DLSS-G with the Multiplier below (2x, 3x, 4x). Recommended.
+;   dynamic = Dynamic Multi Frame Generation: DLSS-G picks the multiplier every frame to hit
+;             DynamicTargetFps (0 = your display's refresh rate). Needs driver/hardware support;
+;             falls back to fixed when the card does not report it.
+;   off     = no frame generation; the game's real frames are presented as-is.
+Mode = fixed
+
 ; Frame-generation multiplier: 2 = 2x, 3 = 3x, 4 = 4x. 3x and 4x are Multi-Frame Generation and
 ; need an RTX 50-series card. The value is clamped down to whatever the card reports as its maximum.
-Multiplier = 2
+Multiplier = 3
 
-; Flip metering:
+; Target framerate for Mode = dynamic. 0 = auto (display refresh rate).
+DynamicTargetFps = 0
+
+; Flip metering (takes effect at the next game start):
 ;   hardware = the Blackwell display engine paces the generated frames (true 3x/4x MFG). Recommended.
 ;   software = block NvAPI_D3D12_SetFlipConfig so DLSS-G uses its software pacer (clean 2x only).
 FlipMetering = hardware
 
 [Upscaling]
 ; DLSS super-resolution in place of the game's FSR upscaler.
-;   true  = DLSS. The quality mode is picked from the in-game FSR preset / render resolution.
-;   false = leave the upscale as FSR.
+;   true  = DLSS.   false = leave the upscale as FSR.
 DLSS = true
 
+; DLSS quality mode. auto picks the mode matching the in-game FSR preset / render resolution
+; (native = DLAA). Otherwise one of: dlaa, quality, balanced, performance, ultraperformance.
+; The render resolution is still whatever the game renders at; this only selects the DLSS model.
+Quality = auto
+
+; DLSS model preset: default (NVIDIA's choice for the mode), or a fixed model letter:
+;   K = transformer, best quality (default for DLAA/Quality/Balanced)
+;   J = transformer, slightly less ghosting, a little more flicker
+;   L = sharper/more stable than J/K, heavier (default for Ultra Performance)
+;   M = like L but closer to J/K in cost (default for Performance)
+;   E, F = legacy CNN models (deprecated)
+Preset = default
+
 [Overlay]
-; Make the Steam overlay report "DLSS" with the correct native/generated frame counts. This only
-; affects what Steam displays; the actual DLSS output is the same either way. Set false and Steam
-; will call it "FSR".
+; Make the Steam overlay report "DLSS" with the correct native/generated frame counts. Only
+; affects what Steam displays. Set false and Steam will call it "FSR".
 SteamOverlayFix = true
 
+; In-game configuration overlay.
+Enabled = true
+; Key that opens/closes it: Home, End, Insert, Delete, PageUp, PageDown, Pause, ScrollLock,
+; F1..F12, Tilde, or a hex virtual-key code such as 0x24.
+ToggleKey = Home
+; FPS counter showing the displayed framerate and the base (pre-frame-generation) framerate.
+ShowFps = true
+; FPS counter position: 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
+FpsCorner = 1
+; Overlay UI scale (0.5 .. 3.0) and paper-white brightness in nits on HDR displays (50 .. 1000).
+Scale = 1.00
+BrightnessNits = 200
+
 [HUD]
-; Experimental. Tag a HUD-less color and UI layer for DLSS-G. Lies of P bakes the UI into the frame,
-; so this does not help there. Leave off.
+; Experimental. Tag a HUD-less color and UI layer for DLSS-G. Lies of P bakes the UI into the
+; frame, so this does not help there. Leave off.
 HudlessTags = false
 
 [Logging]
 ; Write ffx_bridge.log next to the mod. Off by default so a normal install adds no extra files.
-; Turn on only when troubleshooting.
 Debug = false
+
+[Compat]
+; Troubleshooting only. true = tag resources through the deprecated global slSetTag path and
+; report host SDK 2.7.4 to Streamline (the behaviour of fsr2dlss builds before Streamline 2.14).
+LegacyTagging = false
