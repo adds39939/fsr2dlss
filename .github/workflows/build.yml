@@ -40,7 +40,15 @@ jobs:
         run: src/fetch_deps.sh
 
       - name: Build and package
-        run: src/build.sh
+        run: |
+          set -o pipefail
+          if ! src/build.sh > build.log 2>&1; then
+            echo "::error title=Build failed::$(grep -E 'error|Error|undefined reference' build.log | head -c 3500 | tr '\n' '|')"
+            echo "::error title=Build log tail::$(tail -n 40 build.log | head -c 3500 | tr '\n' '|')"
+            cat build.log
+            exit 1
+          fi
+          cat build.log
 
       - name: Check exports
         run: |
