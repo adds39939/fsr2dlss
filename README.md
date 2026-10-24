@@ -81,9 +81,12 @@ sequenceDiagram
 - An in-game overlay on **Home** (configurable), available from the moment the game starts whether or
   not FSR or frame generation is on. It shows the mod's status (is the game issuing FSR calls, did the
   original AMD DLL load, is Streamline up, which swapchain is hooked), lets you change the DLSS preset
-  and quality mode, the frame-generation preset and multiplier, and the FPS counter, and saves the
+  and quality mode, the frame-generation mode, multiplier and model preset (A/B/C), and the FPS
+  counter, and saves the
   settings back to `fsr2dlss.ini`. The FPS counter shows the displayed framerate and the base
   (pre-frame-gen) framerate.
+- The overlay is handed to DLSS-G as a separate UI layer, so frame generation composites it instead of
+  warping it.
 - The Steam overlay reports DLSS with the correct native and generated frame counts.
 
 ## Requirements

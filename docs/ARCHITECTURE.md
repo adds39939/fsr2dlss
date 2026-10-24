@@ -97,6 +97,11 @@ whose `numFramesToGenerate` selects the multiplier and whose `eDynamic` mode is 
   markers and to draw the overlay. The swapchain is never wrapped in a separate COM object, because
   that breaks the identity Streamline's frame generation binds to.
 - Per-frame feed (`feedDLSSG`, driven from FRAMEGEN PREPARE, keyed by the game's frame id), below.
+- UI layer for DLSS-G: after the overlay has drawn, the Present hook tags the hud-less copy of the
+  back buffer and the overlay's UI colour+alpha texture (`kBufferTypeHUDLessColor`,
+  `kBufferTypeUIColorAndAlpha`, valid until present) and sets
+  `enableUserInterfaceRecomposition`, so DLSS-G composites the overlay onto generated frames rather
+  than interpolating it. The tags are cleared with null resources when the layers stop.
 - Live statistics (`BridgeStats`) for the overlay: presents per second (the base framerate, since the
   game presents once per rendered frame) and the sum of `DLSSGState::numFramesActuallyPresented` per
   second (the displayed framerate), plus the card's MFG limits and DLSS-G status.
@@ -120,7 +125,10 @@ a native swapchain that lands here).
 
 The in-game overlay, Dear ImGui drawn straight into the current swapchain's back buffer from a
 Present hook, on the game's direct queue (one command list, three rotating allocators fenced on that
-queue; back-buffer references are released every frame so `ResizeBuffers` is never blocked). It binds
+queue; back-buffer references are released every frame so `ResizeBuffers` is never blocked). The UI
+is drawn into its own premultiplied RGBA layer and composited onto the back buffer with a fullscreen
+blend; on the DLSS-G path a copy of the back buffer is taken before that composite and both textures
+are handed to the bridge as the hud-less and UI layers. It binds
 lazily to whatever swapchain and queue a hook hands it (the DLSS-G one from the bridge, the game's own
 from dxgihook.cpp) and rebinds when they change. Its status panel reads `ModStatus` (`status.h`): what
 the game is calling (FSR contexts, upscale passes per second, the FG toggle), whether the original AMD
@@ -135,7 +143,12 @@ own swapchain it is derived from the back-buffer format and the output's HDR sta
 
 ### nvhook.cpp
 
-Inline-hooks `nvapi64.dll!nvapi_QueryInterface` with MinHook. When `FlipMetering = software` it
+Inline-hooks `nvapi64.dll!nvapi_QueryInterface` with MinHook. It also answers NGX's driver-profile
+query for the DLSS Frame Generation model preset: NGX resolves `NvAPI_DRS_GetSetting` through the same
+export and reads `NGX_DLSS_FG_OVERRIDE` / `NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION` (the settings
+the NVIDIA App writes); when `FgPreset` is set, the hook returns "override on" and the chosen letter,
+on Windows and under Proton (dxvk-nvapi) alike. The bridge restarts DLSS-G for a few presents after a
+preset change so NGX re-creates the feature with it. When `FlipMetering = software` it
 returns null for `NvAPI_D3D12_SetFlipConfig` (id `0xF3148C42`) and forwards everything else, which
 drops DLSS-G onto its software pacer for clean 2x. When `FlipMetering = hardware` (the default) it
 blocks nothing, and the Blackwell display engine's flip queue paces the generated frames for true

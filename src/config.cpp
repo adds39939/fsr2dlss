@@ -94,6 +94,21 @@ static int srPresetFromName(const char* s)
     return 0;
 }
 
+// DLSS-G model presets are letters A.. mapped to the driver-profile enum (A = 1). The UI offers A-C,
+// the ini accepts any letter the model DLL might support.
+const char* config_fg_preset_name(int p)
+{
+    static const char* names[] = { "default", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M" };
+    return (p >= 0 && p < (int)(sizeof(names) / sizeof(names[0]))) ? names[p] : "default";
+}
+int config_fg_preset_from_name(const char* s)
+{
+    if (!s || !*s || !_stricmp(s, "default") || !_stricmp(s, "off")) return 0;
+    if (!s[1] && toupper((unsigned char)s[0]) >= 'A' && toupper((unsigned char)s[0]) <= 'M') return toupper((unsigned char)s[0]) - 'A' + 1;
+    if (isdigit((unsigned char)s[0])) { int v = atoi(s); return (v >= 0 && v <= 13) ? v : 0; }
+    return 0;
+}
+
 static const char* kFgModeNames[FG_MODE_COUNT] = { "off", "fixed", "dynamic" };
 const char* config_fg_mode_name(int m) { return (m >= 0 && m < FG_MODE_COUNT) ? kFgModeNames[m] : "fixed"; }
 static int fgModeFromName(const char* s)
@@ -129,6 +144,9 @@ static void parseInto(Config& c, FILE* f)
         if      (!strcmp(key,"multiplier"))       g_cfg.fgMultiplier = clampi(atoi(val), 2, 4);
         else if (!strcmp(key,"mode"))             g_cfg.fgMode = fgModeFromName(val);
         else if (!strcmp(key,"dynamictargetfps")) { float v = (float)atof(val); g_cfg.fgDynamicFps = (v >= 0 && v < 1000) ? v : 0; }
+        else if (!strcmp(key,"fgpreset"))         g_cfg.fgPreset = config_fg_preset_from_name(val);
+        else if (!strcmp(key,"uilayer"))          g_cfg.uiLayer = cfgBool(val);
+        else if (!strcmp(key,"uirecomposition"))  g_cfg.uiRecompose = cfgBool(val);
         else if (!strcmp(key,"flipmetering"))     g_cfg.flipMode = !_stricmp(val,"hardware")?1 : (!_stricmp(val,"auto")?2:0);
         else if (!strcmp(key,"dlss"))             g_cfg.dlssSR = cfgBool(val);
         else if (!strcmp(key,"quality"))          g_cfg.srQuality = srQualityFromName(val);
@@ -159,8 +177,8 @@ void config_load()
     g_cfg = c;
     InterlockedExchange(&g_loadState, 2);
     if (!f) { CL("[CFG] no fsr2dlss.ini next to the mod; using defaults"); return; }
-    CL("[CFG] fsr2dlss.ini: fgMode=%s multiplier=%dx dynFps=%.0f flipMetering=%d dlss=%d quality=%s preset=%s steamFix=%d overlay=%d key=%s showFps=%d hudlessTags=%d legacyTagging=%d",
-       config_fg_mode_name(g_cfg.fgMode), g_cfg.fgMultiplier, g_cfg.fgDynamicFps, g_cfg.flipMode, (int)g_cfg.dlssSR,
+    CL("[CFG] fsr2dlss.ini: fgMode=%s multiplier=%dx dynFps=%.0f fgPreset=%s uiLayer=%d flipMetering=%d dlss=%d quality=%s preset=%s steamFix=%d overlay=%d key=%s showFps=%d hudlessTags=%d legacyTagging=%d",
+       config_fg_mode_name(g_cfg.fgMode), g_cfg.fgMultiplier, g_cfg.fgDynamicFps, config_fg_preset_name(g_cfg.fgPreset), (int)g_cfg.uiLayer, g_cfg.flipMode, (int)g_cfg.dlssSR,
        config_sr_quality_name(g_cfg.srQuality), config_sr_preset_name(g_cfg.srPreset), (int)g_cfg.steamFix,
        (int)g_cfg.overlayOn, config_key_name(g_cfg.overlayKey), (int)g_cfg.showFps, (int)g_cfg.hudlessTags, (int)g_cfg.legacyTagging);
 }
@@ -195,6 +213,12 @@ bool config_save()
         "\n"
         "; Target framerate for Mode = dynamic. 0 = auto (display refresh rate).\n"
         "DynamicTargetFps = %.0f\n"
+        "\n"
+        "; DLSS Frame Generation model preset: default, or a letter (A, B, C). This is the same setting the\n"
+        "; NVIDIA App exposes as the frame-generation model preset; the mod answers the driver-profile query\n"
+        "; NGX makes for it. Applied when frame generation (re)starts; restart the game if the DLSS-G\n"
+        "; indicator still shows the old preset.\n"
+        "FgPreset = %s\n"
         "\n"
         "; Flip metering (takes effect at the next game start):\n"
         ";   hardware = the Blackwell display engine paces the generated frames (true 3x/4x MFG). Recommended.\n"
@@ -236,6 +260,10 @@ bool config_save()
         "; Overlay UI scale (0.5 .. 3.0) and paper-white brightness in nits on HDR displays (50 .. 1000).\n"
         "Scale = %.2f\n"
         "BrightnessNits = %.0f\n"
+        "; Hand the overlay to DLSS-G as a separate UI layer (hud-less colour + UI colour/alpha tags) so\n"
+        "; frame generation does not warp it, and let DLSS-G recomposite the UI on generated frames.\n"
+        "UiLayer = %s\n"
+        "UiRecomposition = %s\n"
         "\n"
         "[HUD]\n"
         "; Experimental. Tag a HUD-less color and UI layer for DLSS-G. Lies of P bakes the UI into the\n"
@@ -250,11 +278,11 @@ bool config_save()
         "; Troubleshooting only. true = tag resources through the deprecated global slSetTag path and\n"
         "; report host SDK 2.7.4 to Streamline (the behaviour of fsr2dlss builds before Streamline 2.14).\n"
         "LegacyTagging = %s\n",
-        config_fg_mode_name(c.fgMode), c.fgMultiplier, c.fgDynamicFps,
+        config_fg_mode_name(c.fgMode), c.fgMultiplier, c.fgDynamicFps, config_fg_preset_name(c.fgPreset),
         c.flipMode == 1 ? "hardware" : (c.flipMode == 2 ? "auto" : "software"),
         b2s(c.dlssSR), config_sr_quality_name(c.srQuality), config_sr_preset_name(c.srPreset),
         b2s(c.steamFix), b2s(c.overlayOn), config_key_name(c.overlayKey), b2s(c.showFps), c.fpsCorner,
-        c.overlayScale, c.overlayNits, b2s(c.hudlessTags), b2s(c.debug), b2s(c.legacyTagging));
+        c.overlayScale, c.overlayNits, b2s(c.uiLayer), b2s(c.uiRecompose), b2s(c.hudlessTags), b2s(c.debug), b2s(c.legacyTagging));
     bool ok = (fclose(f) == 0);
     if (ok) ok = MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
     if (!ok) { CL("[CFG] save failed: err=%lu", GetLastError()); DeleteFileW(tmp); }

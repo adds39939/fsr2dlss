@@ -6,8 +6,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
+#include <cstring>
+#include <cstddef>
 #include <cstdarg>
 #include "MinHook.h"
+#include "config.h"
 
 extern "C" void bridge_logs(const char* s);
 static void NL(const char* fmt, ...)
@@ -40,6 +43,61 @@ extern "C" bool mh_ensure_init()
 }
 
 static const unsigned int NVAPI_ID_D3D12_SetFlipConfig = 0xF3148C42u;
+static const unsigned int NVAPI_ID_DRS_GetSetting       = 0x73BF8338u;   // NvAPI_DRS_GetSetting (nvapi_interface.h)
+
+// ---- DLSS-G model preset via the driver profile --------------------------------------------------
+// The frame-generation model preset (A/B/C...) has no Streamline or NGX API: NGX reads the NVIDIA App's
+// per-game driver-profile override through NvAPI_DRS_GetSetting (also under Proton via dxvk-nvapi).
+// We answer those two queries ourselves with the configured preset, so the user picks the model in
+// fsr2dlss.ini / the overlay instead of the NVIDIA App. Setting ids and values: NvApiDriverSettings.h.
+static const unsigned int DRS_NGX_DLSS_FG_OVERRIDE_ID                         = 0x10E41E03u;   // 0 off, 1 on
+static const unsigned int DRS_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID = 0x10E41DF1u;   // 0 off, 1 = A, 2 = B, 3 = C ...
+
+#pragma pack(push, 4)                            // nvapi.h declares the DRS structs under pack(4)
+struct NvDrsBinarySetting { unsigned int valueLength; unsigned char valueData[4096]; };
+struct NvDrsSetting {                           // NVDRS_SETTING_V1 (nvapi.h)
+    unsigned int   version;
+    unsigned short settingName[2048];
+    unsigned int   settingId;
+    unsigned int   settingType;                 // 0 = NVDRS_DWORD_TYPE
+    unsigned int   settingLocation;             // 0 = NVDRS_CURRENT_PROFILE_LOCATION
+    unsigned int   isCurrentPredefined;
+    unsigned int   isPredefinedValid;
+    union { unsigned int u32PredefinedValue; NvDrsBinarySetting binaryPredefinedValue; unsigned short wszPredefinedValue[2048]; unsigned long long u64PredefinedValue; };
+    union { unsigned int u32CurrentValue;    NvDrsBinarySetting binaryCurrentValue;    unsigned short wszCurrentValue[2048];    unsigned long long u64CurrentValue; };
+};
+#pragma pack(pop)
+static_assert(sizeof(NvDrsSetting) == 12320, "NVDRS_SETTING_V1 layout (nvapi.h, pack 4)");
+static_assert(offsetof(NvDrsSetting, u32CurrentValue) == 8220, "NVDRS_SETTING_V1 currentValue offset");
+static const unsigned int NVDRS_SETTING_VER1 = (unsigned int)sizeof(NvDrsSetting) | (1u << 16);
+
+typedef int (__cdecl* PFN_NvAPI_DRS_GetSetting)(void* hSession, void* hProfile, unsigned int settingId, NvDrsSetting* pSetting);
+static PFN_NvAPI_DRS_GetSetting o_DRS_GetSetting = nullptr;
+
+static int __cdecl hk_NvAPI_DRS_GetSetting(void* hSession, void* hProfile, unsigned int settingId, NvDrsSetting* pSetting)
+{
+    int r = o_DRS_GetSetting ? o_DRS_GetSetting(hSession, hProfile, settingId, pSetting) : -1;
+    if (!pSetting) return r;
+    int preset = g_cfg.fgPreset;
+    if (preset <= 0) return r;   // default: leave the driver profile alone
+    if (settingId != DRS_NGX_DLSS_FG_OVERRIDE_ID && settingId != DRS_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID) return r;
+    unsigned int value = (settingId == DRS_NGX_DLSS_FG_OVERRIDE_ID) ? 1u : (unsigned int)preset;
+    if (r != 0) {   // not in the profile: synthesise the whole record (keep the caller's version)
+        unsigned int ver = pSetting->version;
+        memset(pSetting, 0, sizeof(*pSetting));
+        pSetting->version = ver ? ver : NVDRS_SETTING_VER1;
+        pSetting->settingId = settingId;
+        pSetting->settingType = 0;
+        pSetting->settingLocation = 0;
+        pSetting->isPredefinedValid = 1;
+        pSetting->u32PredefinedValue = 0;
+    }
+    pSetting->isCurrentPredefined = 0;
+    pSetting->u32CurrentValue = value;
+    static int logged = 0;
+    if (logged < 4) { ++logged; NL("[NVHOOK] DRS GetSetting(0x%08X) -> %u (DLSS-G preset %s, driver said %d)", settingId, value, config_fg_preset_name(preset), r); }
+    return 0;   // NVAPI_OK
+}
 
 typedef void* (__cdecl* PFN_nvapi_QueryInterface)(unsigned int id);
 static PFN_nvapi_QueryInterface o_nvapi_QI = nullptr;
@@ -49,7 +107,13 @@ static void* __cdecl hk_nvapi_QueryInterface(unsigned int id)
 {
     if (id == NVAPI_ID_D3D12_SetFlipConfig && g_blockFlip)
         return nullptr;   // hide SetFlipConfig -> DLSS-G uses the software pacer
-    return o_nvapi_QI ? o_nvapi_QI(id) : nullptr;
+    void* fn = o_nvapi_QI ? o_nvapi_QI(id) : nullptr;
+    if (id == NVAPI_ID_DRS_GetSetting && fn) {
+        // Hand out our detour; NGX core resolves NvAPI_DRS_GetSetting through this same export.
+        if (!o_DRS_GetSetting) { o_DRS_GetSetting = (PFN_NvAPI_DRS_GetSetting)fn; NL("[NVHOOK] NvAPI_DRS_GetSetting@%p intercepted for the DLSS-G preset", fn); }
+        return (void*)&hk_NvAPI_DRS_GetSetting;
+    }
+    return fn;
 }
 
 extern "C" void nvhook_set_flip_block(bool block) { g_blockFlip = block; }
