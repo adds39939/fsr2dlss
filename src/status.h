@@ -22,6 +22,8 @@ struct ModStatus {
     int      slState           = SL_UNTRIED;
     bool     slSwapchainLive   = false;   // the DLSS-G swapchain exists and its Present is hooked
     bool     gameFgEnabled     = false;   // the game's frame-generation toggle (FRAMEGEN configure)
+    bool     gameHudless       = false;   // the game passes a HUD-less colour buffer to FSR frame generation
+    int      uiLayerMode       = 0;       // 0 none, 1 overlay only (hud-less = frame copy), 2 game HUD + overlay (hud-less = game's buffer)
     // dxgihook.cpp
     bool     dxgiHooked        = false;   // native IDXGISwapChain::Present hooked
     bool     dxgiHookFailed    = false;

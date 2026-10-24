@@ -52,6 +52,11 @@ void  slbridge_frame_start(void);
 // Returns true if DLSS did the upscale (caller must NOT forward to AMD); false to fall back to FSR.
 bool  slbridge_upscale(const void* dispatchDesc);
 
+// The HUD-less colour buffer the game passed to FSR's frame-generation configure this frame, if any:
+// the native ID3D12Resource, its D3D12_RESOURCE_STATES at present time, and its size. Lets the
+// overlay build DLSS-G's UI layer from (back buffer - hud-less) so the game's own HUD is protected too.
+bool  slbridge_game_hudless(void** resource, uint32_t* d3d12State, uint32_t* width, uint32_t* height);
+
 // Per-frame handlers for our contexts. Return an ffxReturnCode_t (0 == OK).
 uint32_t slbridge_configure(void* handle, const void* desc);
 uint32_t slbridge_query(void* handle, void* desc);

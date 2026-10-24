@@ -92,7 +92,13 @@ static D3D12_CPU_DESCRIPTOR_HANDLE g_uiSrvCpu{}; static D3D12_GPU_DESCRIPTOR_HAN
 static ID3D12RootSignature*       g_compRs     = nullptr;
 static ID3D12PipelineState*       g_compPso    = nullptr;
 static DXGI_FORMAT                g_compFmt    = DXGI_FORMAT_UNKNOWN;
+// UI extraction (game HUD = back buffer where it differs from the game's hud-less buffer)
+static ID3D12PipelineState*       g_extractPso = nullptr;
+static DXGI_FORMAT                g_extractFmt = DXGI_FORMAT_UNKNOWN;   // UI texture format it writes
+static D3D12_CPU_DESCRIPTOR_HANDLE g_exSrvCpu{};  static D3D12_GPU_DESCRIPTOR_HANDLE g_exSrvGpu{};  static bool g_exSrvValid = false;   // 2 consecutive slots: bb, game hud-less
 static bool                       g_layersValid = false;    // layers produced by the last overlay_render
+static bool                       g_layersGameHud = false;  // ... with the game's hud-less buffer (game HUD in the UI layer)
+static void*                      g_gameHud = nullptr; static unsigned g_gameHudState = 0;
 static bool                       g_gpuReady   = false;
 static bool                       g_imguiReady = false;
 static bool                       g_dx12Ready  = false;
@@ -228,6 +234,10 @@ static void shutdownDx12Backend()
     waitGpuIdle();
     ImGui_ImplDX12_Shutdown();
     memset(g_srvUsed, 0, sizeof(g_srvUsed));
+    // Our own descriptors live in the same heap and survive a backend restart.
+    SIZE_T base = g_srvHeap ? g_srvHeap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
+    if (g_uiSrvValid && g_srvInc) g_srvUsed[(g_uiSrvCpu.ptr - base) / g_srvInc] = true;
+    if (g_exSrvValid && g_srvInc) { SIZE_T i = (g_exSrvCpu.ptr - base) / g_srvInc; g_srvUsed[i] = true; if (i + 1 < kSrvHeapSize) g_srvUsed[i + 1] = true; }
     g_dx12Ready = false;
 }
 
@@ -235,9 +245,11 @@ static void releaseLayers()
 {
     waitGpuIdle();
     if (g_uiSrvValid) { srvFree(nullptr, g_uiSrvCpu, g_uiSrvGpu); g_uiSrvValid = false; }
+    if (g_exSrvValid) { srvFree(nullptr, g_exSrvCpu, g_exSrvGpu); D3D12_CPU_DESCRIPTOR_HANDLE c2{ g_exSrvCpu.ptr + g_srvInc }; srvFree(nullptr, c2, g_exSrvGpu); g_exSrvValid = false; }
+    g_gameHud = nullptr;
     rel(g_uiTex); rel(g_hudTex); g_uiFmt = g_hudFmt = DXGI_FORMAT_UNKNOWN; g_layerW = g_layerH = 0; g_layersValid = false;
 }
-static void releaseComposite() { waitGpuIdle(); rel(g_compPso); rel(g_compRs); g_compFmt = DXGI_FORMAT_UNKNOWN; }
+static void releaseComposite() { waitGpuIdle(); rel(g_compPso); rel(g_compRs); g_compFmt = DXGI_FORMAT_UNKNOWN; rel(g_extractPso); g_extractFmt = DXGI_FORMAT_UNKNOWN; }
 
 static void releaseGpuObjects()
 {
@@ -261,6 +273,7 @@ static bool createComposite(DXGI_FORMAT rtFmt)
     param.DescriptorTable.NumDescriptorRanges = 1; param.DescriptorTable.pDescriptorRanges = &range; param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC samp{}; samp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP; samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    samp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER; samp.MaxLOD = D3D12_FLOAT32_MAX;
     D3D12_ROOT_SIGNATURE_DESC rs{}; rs.NumParameters = 1; rs.pParameters = &param; rs.NumStaticSamplers = 1; rs.pStaticSamplers = &samp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
     ID3DBlob* sig = nullptr; ID3DBlob* err = nullptr;
@@ -297,6 +310,70 @@ static bool createComposite(DXGI_FORMAT rtFmt)
     vs->Release(); ps->Release();
     if (FAILED(hr)) { OL("[OVL] composite PSO failed 0x%08lx (fmt=%u)", (unsigned long)hr, (unsigned)rtFmt); return false; }
     g_compFmt = rtFmt;
+    return true;
+}
+
+static ID3D12RootSignature* g_extractRs = nullptr;
+
+// Two consecutive SRV slots for the extraction pass (descriptor table of 2).
+static bool allocExtractSrvs()
+{
+    if (g_exSrvValid) return true;
+    for (UINT i = 0; i + 1 < kSrvHeapSize; ++i) if (!g_srvUsed[i] && !g_srvUsed[i + 1]) {
+        g_srvUsed[i] = g_srvUsed[i + 1] = true;
+        g_exSrvCpu.ptr = g_srvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)i * g_srvInc;
+        g_exSrvGpu.ptr = g_srvHeap->GetGPUDescriptorHandleForHeapStart().ptr + (UINT64)i * g_srvInc;
+        g_exSrvValid = true; return true;
+    }
+    return false;
+}
+
+// Fullscreen pass writing the UI layer from the game's frame: where the back buffer differs from the
+// game's hud-less buffer there is HUD; emit its colour premultiplied with alpha 1, else transparent.
+// This satisfies DLSS-G's Final = UI + (1 - UI.a) * Hudless exactly.
+static bool createExtract(DXGI_FORMAT uiFmt)
+{
+    if (g_extractPso && g_extractFmt == uiFmt) return true;
+    waitGpuIdle(); rel(g_extractPso); g_extractFmt = DXGI_FORMAT_UNKNOWN;
+    // Root signature with a 2-descriptor table.
+    D3D12_DESCRIPTOR_RANGE range{}; range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER param{}; param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1; param.DescriptorTable.pDescriptorRanges = &range; param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samp{}; samp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP; samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    samp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER; samp.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC rs{}; rs.NumParameters = 1; rs.pParameters = &param; rs.NumStaticSamplers = 1; rs.pStaticSamplers = &samp;
+    rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+    static ID3D12RootSignature* s_rs = nullptr;
+    if (!s_rs) {
+        ID3DBlob* sig = nullptr; ID3DBlob* err = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) || !sig) { OL("[OVL] extract root signature failed: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); return false; }
+        HRESULT hr = g_dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&s_rs)); sig->Release();
+        if (FAILED(hr)) return false;
+    }
+    static const char* src =
+        "Texture2D bb : register(t0); Texture2D hud : register(t1); SamplerState s : register(s0);\n"
+        "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+        "V vs(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2); o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        "float4 ps(V i) : SV_Target { float3 f = bb.Sample(s, i.uv).rgb; float3 h = hud.Sample(s, i.uv).rgb;\n"
+        "  float d = max(max(abs(f.r - h.r), abs(f.g - h.g)), abs(f.b - h.b)); float a = d > (1.0 / 255.0) ? 1.0 : 0.0; return float4(f * a, a); }\n";
+    ID3DBlob* vs = nullptr; ID3DBlob* ps = nullptr; ID3DBlob* err = nullptr;
+    if (FAILED(D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err))) { OL("[OVL] extract VS: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); return false; }
+    if (FAILED(D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err))) { OL("[OVL] extract PS: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); vs->Release(); return false; }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = s_rs;
+    pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;   // opaque write
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1; pso.RTVFormats[0] = uiFmt; pso.SampleDesc.Count = 1; pso.NodeMask = 1;
+    HRESULT hr = g_dev->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_extractPso));
+    vs->Release(); ps->Release();
+    if (FAILED(hr)) { OL("[OVL] extract PSO failed 0x%08lx", (unsigned long)hr); return false; }
+    g_extractFmt = uiFmt;
+    g_extractRs = s_rs;
     return true;
 }
 
@@ -593,7 +670,9 @@ static void drawStatus()
         (s.fgStatus & 4) ? " hdr-format" : "", (s.fgStatus & 8) ? " constants-invalid" : "", (s.fgStatus & 16) ? " backbuffer-index" : "");
     if (g_cfg.steamFix) row("Steam overlay", kDim, "FSR detector removed %u time(s)", st.steamUnhooks);
     if (g_cfg.fgPreset > 0) row("FG preset", kDim, "requesting %s via the driver profile (confirm in streamline\\sl.log: \"render preset\")", config_fg_preset_name(g_cfg.fgPreset));
-    if (s.fgApplied && g_cfg.uiLayer) row("UI layer", g_layersValid ? kOk : kWarn, g_layersValid ? "hud-less + UI tagged, overlay composited after frame generation" : "not produced this frame");
+    if (s.fgApplied && g_cfg.uiLayer) row("UI layer", st.uiLayerMode ? kOk : kWarn, st.uiLayerMode == 0 ? "not produced last frame" :
+        (st.uiLayerMode == 2 ? "game hud-less + extracted HUD: game UI and overlay composited after frame generation" : "frame copy as hud-less: overlay protected; the game gives FSR no hud-less buffer, so its HUD is still interpolated"));
+    else if (s.fgApplied) row("Game hud-less", st.gameHudless ? kOk : kWarn, st.gameHudless ? "provided by the game" : "not provided by the game");
 }
 
 static void drawMenu()
@@ -744,7 +823,6 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     updateRates(slPath);
     pollToggleKey();
     bool visible = g_visible != 0;
-    if (!visible && !g_cfg.showFps) return;
 
     // Layers for DLSS-G only make sense when frame generation is actually running on this swapchain.
     bool wantLayers = slPath && g_cfg.uiLayer && g_stats.fgApplied > 0;
@@ -756,8 +834,20 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     DXGI_FORMAT uiFmt = uiFormatFor(g_colorMode);
     if (g_dx12Ready && uiFmt != g_rtvFormat) { OL("[OVL] UI layer format changed %u -> %u, recreating backend", (unsigned)g_rtvFormat, (unsigned)uiFmt); shutdownDx12Backend(); }
     if (!initImGui(uiFmt)) { g_failed = true; return; }
-    if (!ensureLayerTextures(g_bbW, g_bbH, uiFmt, d.Format, wantLayers)) { g_failed = true; return; }
+    // If the game hands FSR a hud-less buffer in the back buffer's format and size, DLSS-G can get the
+    // real hud-less and a UI layer that contains the game's HUD too (extracted as back buffer minus
+    // hud-less), so the game's own UI stops warping as well. Otherwise fall back to a full-frame copy.
+    bool useGameHud = false; void* gameHud = nullptr; uint32_t gameHudState = 0, ghW = 0, ghH = 0;
+    if (wantLayers && slbridge_game_hudless(&gameHud, &gameHudState, &ghW, &ghH) && gameHud) {
+        D3D12_RESOURCE_DESC hd = ((ID3D12Resource*)gameHud)->GetDesc();
+        useGameHud = (hd.Format == d.Format && hd.Width == d.Width && hd.Height == d.Height);
+        static bool loggedGame = false;
+        if (!loggedGame) { loggedGame = true; OL("[OVL] game hud-less buffer %p %ux%u fmt=%u state=0x%x -> %s", gameHud, (unsigned)hd.Width, hd.Height, (unsigned)hd.Format, gameHudState, useGameHud ? "extracting the game HUD into the UI layer" : "format/size mismatch, using a frame copy as hud-less"); }
+    }
+    if (!ensureLayerTextures(g_bbW, g_bbH, uiFmt, d.Format, wantLayers && !useGameHud)) { g_failed = true; return; }
     if (!createComposite(d.Format)) { g_failed = true; return; }
+    if (useGameHud && (!createExtract(uiFmt) || !allocExtractSrvs())) { OL("[OVL] extraction unavailable, using a frame copy as hud-less"); useGameHud = false; if (!ensureLayerTextures(g_bbW, g_bbH, uiFmt, d.Format, wantLayers)) { g_failed = true; return; } }
+    g_gameHud = useGameHud ? gameHud : nullptr; g_gameHudState = gameHudState;
     if (g_appliedScale != g_cfg.overlayScale) applyStyle();
 
     // Wait for the allocator we are about to reuse.
@@ -789,22 +879,41 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
         g_cmd->ResourceBarrier(1, &b);
     };
 
-    // 1. Hud-less copy of the finished game frame (before the overlay goes in). Stays COPY_DEST.
-    if (wantLayers && g_hudTex) {
-        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        g_cmd->CopyResource(g_hudTex, bb);
-        barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    } else {
-        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    }
-
-    // 2. Draw the UI into its own (cleared, premultiplied) layer.
-    barrier(g_uiTex, g_uiState, D3D12_RESOURCE_STATE_RENDER_TARGET); g_uiState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    const float clear[4] = { 0, 0, 0, 0 };
-    g_cmd->ClearRenderTargetView(rtvUi, clear, 0, nullptr);
-    g_cmd->OMSetRenderTargets(1, &rtvUi, FALSE, nullptr);
     ID3D12DescriptorHeap* heaps[] = { g_srvHeap };
     g_cmd->SetDescriptorHeaps(1, heaps);
+    barrier(g_uiTex, g_uiState, D3D12_RESOURCE_STATE_RENDER_TARGET); g_uiState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_VIEWPORT vp{ 0, 0, (float)g_bbW, (float)g_bbH, 0, 1 }; D3D12_RECT scissor{ 0, 0, (LONG)g_bbW, (LONG)g_bbH };
+    if (useGameHud) {
+        // 1a. UI layer = game HUD extracted from (back buffer - game hud-less); hud-less stays the game's.
+        D3D12_CPU_DESCRIPTOR_HANDLE srvBb = g_exSrvCpu, srvHud = { g_exSrvCpu.ptr + g_srvInc };
+        g_dev->CreateShaderResourceView(bb, nullptr, srvBb);
+        g_dev->CreateShaderResourceView((ID3D12Resource*)gameHud, nullptr, srvHud);
+        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barrier((ID3D12Resource*)gameHud, (D3D12_RESOURCE_STATES)gameHudState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        g_cmd->OMSetRenderTargets(1, &rtvUi, FALSE, nullptr);
+        g_cmd->RSSetViewports(1, &vp); g_cmd->RSSetScissorRects(1, &scissor);
+        g_cmd->SetGraphicsRootSignature(g_extractRs);
+        g_cmd->SetPipelineState(g_extractPso);
+        g_cmd->SetGraphicsRootDescriptorTable(0, g_exSrvGpu);
+        g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_cmd->DrawInstanced(3, 1, 0, 0);
+        barrier((ID3D12Resource*)gameHud, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)gameHudState);
+        barrier(bb, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    } else {
+        // 1b. Hud-less = copy of the finished game frame (before the overlay goes in). Stays COPY_DEST.
+        if (wantLayers && g_hudTex) {
+            barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g_cmd->CopyResource(g_hudTex, bb);
+            barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        } else {
+            barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        const float clear[4] = { 0, 0, 0, 0 };
+        g_cmd->ClearRenderTargetView(rtvUi, clear, 0, nullptr);
+    }
+
+    // 2. Draw the overlay into the (premultiplied) UI layer, on top of the extracted game HUD if any.
+    g_cmd->OMSetRenderTargets(1, &rtvUi, FALSE, nullptr);
 
     EnterCriticalSection(&g_cs);
     ImGuiIO& io = ImGui::GetIO();
@@ -827,7 +936,6 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     // 3. Composite the UI layer onto the back buffer.
     barrier(g_uiTex, g_uiState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); g_uiState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     g_cmd->OMSetRenderTargets(1, &rtvBb, FALSE, nullptr);
-    D3D12_VIEWPORT vp{ 0, 0, (float)g_bbW, (float)g_bbH, 0, 1 }; D3D12_RECT scissor{ 0, 0, (LONG)g_bbW, (LONG)g_bbH };
     g_cmd->RSSetViewports(1, &vp); g_cmd->RSSetScissorRects(1, &scissor);
     g_cmd->SetGraphicsRootSignature(g_compRs);
     g_cmd->SetPipelineState(g_compPso);
@@ -835,7 +943,9 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_cmd->DrawInstanced(3, 1, 0, 0);
     barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    g_layersValid = wantLayers && g_hudTex != nullptr;
+    g_layersValid = wantLayers && (useGameHud || g_hudTex != nullptr);
+    g_layersGameHud = useGameHud;
+    g_status.uiLayerMode = g_layersValid ? (useGameHud ? 2 : 1) : 0;
     if (SUCCEEDED(g_cmd->Close())) {
         ID3D12CommandList* lists[] = { g_cmd };
         g_queue->ExecuteCommandLists(1, lists);
@@ -848,8 +958,9 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
 
 bool overlay_fg_layers(OverlayLayers* out)
 {
-    if (!out || !g_layersValid || !g_uiTex || !g_hudTex) return false;
-    out->hudless = g_hudTex; out->hudlessState = (unsigned)D3D12_RESOURCE_STATE_COPY_DEST;
+    if (!out || !g_layersValid || !g_uiTex) return false;
+    if (g_layersGameHud) { if (!g_gameHud) return false; out->hudless = g_gameHud; out->hudlessState = g_gameHudState; out->hudlessIsGame = true; }
+    else                 { if (!g_hudTex)  return false; out->hudless = g_hudTex;  out->hudlessState = (unsigned)D3D12_RESOURCE_STATE_COPY_DEST; out->hudlessIsGame = false; }
     out->ui = g_uiTex;       out->uiState = (unsigned)g_uiState;
     out->width = g_layerW;   out->height = g_layerH;
     return true;

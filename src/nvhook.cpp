@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <cstddef>
 #include <cstdarg>
 #include "MinHook.h"
 #include "config.h"
@@ -52,7 +53,7 @@ static const unsigned int NVAPI_ID_DRS_GetSetting       = 0x73BF8338u;   // NvAP
 static const unsigned int DRS_NGX_DLSS_FG_OVERRIDE_ID                         = 0x10E41E03u;   // 0 off, 1 on
 static const unsigned int DRS_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID = 0x10E41DF1u;   // 0 off, 1 = A, 2 = B, 3 = C ...
 
-#pragma pack(push, 8)
+#pragma pack(push, 4)                            // nvapi.h declares the DRS structs under pack(4)
 struct NvDrsBinarySetting { unsigned int valueLength; unsigned char valueData[4096]; };
 struct NvDrsSetting {                           // NVDRS_SETTING_V1 (nvapi.h)
     unsigned int   version;
@@ -66,7 +67,8 @@ struct NvDrsSetting {                           // NVDRS_SETTING_V1 (nvapi.h)
     union { unsigned int u32CurrentValue;    NvDrsBinarySetting binaryCurrentValue;    unsigned short wszCurrentValue[2048];    unsigned long long u64CurrentValue; };
 };
 #pragma pack(pop)
-static_assert(sizeof(NvDrsSetting) == 12328, "NVDRS_SETTING_V1 layout");
+static_assert(sizeof(NvDrsSetting) == 12320, "NVDRS_SETTING_V1 layout (nvapi.h, pack 4)");
+static_assert(offsetof(NvDrsSetting, u32CurrentValue) == 8220, "NVDRS_SETTING_V1 currentValue offset");
 static const unsigned int NVDRS_SETTING_VER1 = (unsigned int)sizeof(NvDrsSetting) | (1u << 16);
 
 typedef int (__cdecl* PFN_NvAPI_DRS_GetSetting)(void* hSession, void* hProfile, unsigned int settingId, NvDrsSetting* pSetting);
@@ -80,9 +82,10 @@ static int __cdecl hk_NvAPI_DRS_GetSetting(void* hSession, void* hProfile, unsig
     if (preset <= 0) return r;   // default: leave the driver profile alone
     if (settingId != DRS_NGX_DLSS_FG_OVERRIDE_ID && settingId != DRS_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID) return r;
     unsigned int value = (settingId == DRS_NGX_DLSS_FG_OVERRIDE_ID) ? 1u : (unsigned int)preset;
-    if (r != 0) {   // not in the profile: synthesise the whole record
+    if (r != 0) {   // not in the profile: synthesise the whole record (keep the caller's version)
+        unsigned int ver = pSetting->version;
         memset(pSetting, 0, sizeof(*pSetting));
-        pSetting->version = NVDRS_SETTING_VER1;
+        pSetting->version = ver ? ver : NVDRS_SETTING_VER1;
         pSetting->settingId = settingId;
         pSetting->settingType = 0;
         pSetting->settingLocation = 0;

@@ -40,6 +40,7 @@ done
 "$CXX" "${CXXFLAGS[@]}" -c third_party/imgui_backends/imgui_impl_dx12.cpp -o "$OBJ/imgui_impl_dx12.o"
 
 echo "[build] fsr2dlss"
+"$CC" "${CFLAGS[@]}" -c src/mingw_compat.c -o "$OBJ/mingw_compat.o"
 for f in proxy slbridge nvhook config overlay dxgihook; do
     "$CXX" "${CXXFLAGS[@]}" -Wall -Wno-unused-function -c "src/$f.cpp" -o "$OBJ/$f.o"
 done
@@ -47,7 +48,7 @@ done
 echo "[build] link"
 "$CXX" -shared -static -static-libgcc -static-libstdc++ -s -Wl,--gc-sections \
     -o "$ROOT/build/amd_fidelityfx_dx12.dll" \
-    "$OBJ"/proxy.o "$OBJ"/slbridge.o "$OBJ"/nvhook.o "$OBJ"/config.o "$OBJ"/overlay.o "$OBJ"/dxgihook.o \
+    "$OBJ"/proxy.o "$OBJ"/slbridge.o "$OBJ"/nvhook.o "$OBJ"/config.o "$OBJ"/overlay.o "$OBJ"/dxgihook.o "$OBJ"/mingw_compat.o \
     "$OBJ"/imgui.o "$OBJ"/imgui_draw.o "$OBJ"/imgui_tables.o "$OBJ"/imgui_widgets.o "$OBJ"/imgui_impl_win32.o "$OBJ"/imgui_impl_dx12.o \
     "$OBJ"/mh_buffer.o "$OBJ"/mh_hook.o "$OBJ"/mh_trampoline.o "$OBJ"/mh_hde32.o "$OBJ"/mh_hde64.o \
     src/exports.def -lkernel32 -luser32 -lgdi32 -limm32 -ldwmapi -ld3dcompiler -ld3d12 -ldxgi

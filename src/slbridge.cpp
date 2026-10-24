@@ -415,7 +415,9 @@ static sl::Result setDlssgOptions(sl::DLSSGMode mode, uint32_t numGen, bool inte
     o.numFramesToGenerate = numGen;
     o.flags = interpOnly ? sl::DLSSGFlags::eShowOnlyInterpolatedFrame : sl::DLSSGFlags{};
     o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;   // without it the generated frame is dropped
-    o.enableUserInterfaceRecomposition = (g_layersTagged && g_cfg.uiRecompose) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    // From intent, not from observed tags: the flag selects a code path at feature creation, so it must
+    // not flip on the first tagged frame or during the preset restart.
+    o.enableUserInterfaceRecomposition = (g_cfg.uiLayer && g_cfg.uiRecompose) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     o.dynamicTargetFrameRate = (mode == sl::DLSSGMode::eDynamic) ? g_cfg.fgDynamicFps : 0.0f;
     sl::ViewportHandle vp{0};
     return p_slDLSSGSetOptions(vp, o);
@@ -470,7 +472,7 @@ static void presentPre()
         sl::DLSSGMode mode = wantedFgMode(numGen);
         sl::Result orr = setDlssgOptions(mode, numGen, g_diagShowInterpOnly);
         if ((int)mode != g_lastAppliedMode || numGen != g_lastAppliedGen || g_diagShowInterpOnly != g_lastAppliedInterp) {
-            L("[FGC] slDLSSGSetOptions(mode=%s numFramesToGenerate=%u interpOnly=%d uiRecomposition=%d) -> %d (%s)", sl::getDLSSGModeAsStr(mode), numGen, (int)g_diagShowInterpOnly, (int)(g_layersTagged && g_cfg.uiRecompose), (int)orr, resStr(orr));
+            L("[FGC] slDLSSGSetOptions(mode=%s numFramesToGenerate=%u interpOnly=%d uiRecomposition=%d) -> %d (%s)", sl::getDLSSGModeAsStr(mode), numGen, (int)g_diagShowInterpOnly, (int)(g_cfg.uiLayer && g_cfg.uiRecompose), (int)orr, resStr(orr));
             g_lastAppliedMode = (int)mode; g_lastAppliedGen = numGen; g_lastAppliedInterp = g_diagShowInterpOnly;
         }
         g_stats.fgApplied = (mode == sl::DLSSGMode::eOff) ? 0 : (mode == sl::DLSSGMode::eDynamic ? 1 : numGen + 1);
@@ -995,6 +997,16 @@ extern "C" bool slbridge_upscale(const void* d)
 }
 
 // ---- per-frame handlers for our contexts ------------------------------------
+extern "C" bool slbridge_game_hudless(void** resource, uint32_t* d3d12State, uint32_t* width, uint32_t* height)
+{
+    if (!g_hudless.res || !g_fgEnabled) return false;
+    if (resource) *resource = g_hudless.res;
+    if (d3d12State) *d3d12State = ffxStateToD3D12(g_hudless.state);
+    if (width) *width = g_hudless.width;
+    if (height) *height = g_hudless.height;
+    return true;
+}
+
 extern "C" uint32_t slbridge_configure(void* handle, const void* descV)
 {
     (void)handle;
@@ -1010,6 +1022,7 @@ extern "C" uint32_t slbridge_configure(void* handle, const void* descV)
         g_frameID        = rdU64(descV, 0x88);
         g_stats.fgGameEnabled = g_fgEnabled;
         g_status.gameFgEnabled = g_fgEnabled;
+        g_status.gameHudless = g_hudless.res != nullptr;
         if (wasEnabled && !g_fgEnabled) {
             // PREPARE stops while FG is off, so the token would go stale (the interposer recycles its
             // 6-slot ring); drop it and re-acquire on the next PREPARE.

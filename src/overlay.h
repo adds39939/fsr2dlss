@@ -33,7 +33,7 @@ void overlay_swapchain_destroyed(void* swapchain);
 // D3D12 resource states. Returns false when no layers were produced this frame (UI layer disabled,
 // frame generation off, native path). The bridge tags these for DLSS-G so it composites the overlay
 // after interpolation instead of warping it.
-struct OverlayLayers { void* hudless; unsigned hudlessState; void* ui; unsigned uiState; unsigned width, height; };
+struct OverlayLayers { void* hudless; unsigned hudlessState; void* ui; unsigned uiState; unsigned width, height; bool hudlessIsGame; };
 bool overlay_fg_layers(OverlayLayers* out);
 
 // Release everything.

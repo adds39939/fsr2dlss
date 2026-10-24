@@ -71,11 +71,12 @@ Run $gpp ($cxxflags + @("-c","$deps\imgui\backends\imgui_impl_win32.cpp","-o","$
 Run $gpp ($cxxflags + @("-c","$root\third_party\imgui_backends\imgui_impl_dx12.cpp","-o","$obj\imgui_impl_dx12.o"))
 
 Write-Host "[build] fsr2dlss"
+Run $gcc ($cflags + @("-c","$root\src\mingw_compat.c","-o","$obj\mingw_compat.o"))
 foreach ($f in @("proxy","slbridge","nvhook","config","overlay","dxgihook")) { Run $gpp ($cxxflags + @("-Wall","-Wno-unused-function","-c","$root\src\$f.cpp","-o","$obj\$f.o")) }
 
 Write-Host "[build] link"
 $out = "$root\build\amd_fidelityfx_dx12.dll"
-$objs = @("proxy","slbridge","nvhook","config","overlay","dxgihook","imgui","imgui_draw","imgui_tables","imgui_widgets","imgui_impl_win32","imgui_impl_dx12","mh_buffer","mh_hook","mh_trampoline","mh_hde32","mh_hde64") | ForEach-Object { "$obj\$_.o" }
+$objs = @("proxy","slbridge","nvhook","config","overlay","dxgihook","mingw_compat","imgui","imgui_draw","imgui_tables","imgui_widgets","imgui_impl_win32","imgui_impl_dx12","mh_buffer","mh_hook","mh_trampoline","mh_hde32","mh_hde64") | ForEach-Object { "$obj\$_.o" }
 Run $gpp (@("-shared","-static","-static-libgcc","-static-libstdc++","-s","-Wl,--gc-sections","-o",$out) + $objs + @("$root\src\exports.def","-lkernel32","-luser32","-lgdi32","-limm32","-ldwmapi","-ld3dcompiler","-ld3d12","-ldxgi"))
 "BUILD OK -> $out  ($((Get-Item $out).Length) bytes)"
 
