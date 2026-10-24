@@ -84,8 +84,10 @@ start.
 - **DLSS Super Resolution**: enable/disable DLSS (off = the game's FSR), the DLSS quality mode (Auto
   follows the in-game FSR preset), and the DLSS model preset (Default, K, J, L, M, or the legacy E/F).
 - **DLSS Frame Generation**: the preset (Off, Fixed multiplier, Dynamic Multi-Frame Generation), the
-  multiplier (2x, 3x, 4x, clamped to what the card reports), the Dynamic target fps, and flip metering
-  (hardware/software, applied at the next start).
+  multiplier (2x, 3x, 4x, clamped to what the card reports), the Dynamic target fps, the DLSS-G
+  **model preset** (Default, A, B, C; frame generation restarts for a moment to pick it up), flip
+  metering (hardware/software, applied at the next start), and the UI-layer switch that keeps this
+  overlay out of frame generation.
 - **Overlay**: the FPS counter on/off and its corner, UI scale, HDR brightness, and the Steam overlay
   fix.
 
@@ -102,6 +104,7 @@ The file sits next to `amd_fidelityfx_dx12.dll`. Everything in it can also be ch
 | `[FrameGen] Mode` | `fixed`, `dynamic`, `off` | FG preset. `dynamic` needs card/driver support for Dynamic MFG and falls back to fixed otherwise. |
 | `[FrameGen] Multiplier` | `2`, `3`, `4` | Fixed multiplier. Clamped to the card's maximum. |
 | `[FrameGen] DynamicTargetFps` | number | Target for `dynamic`; `0` = display refresh rate. |
+| `[FrameGen] FgPreset` | `default`, `A`, `B`, `C` | DLSS-G model preset (the NVIDIA App's frame-gen preset, answered to NGX from the mod). |
 | `[FrameGen] FlipMetering` | `hardware`, `software` | `hardware` gives true 3x/4x MFG. `software` is clean 2x. Restart to apply. |
 | `[Upscaling] DLSS` | `true`, `false` | DLSS upscaling on, or pass through to FSR. |
 | `[Upscaling] Quality` | `auto`, `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | DLSS mode; `auto` follows the in-game FSR preset. |
@@ -110,6 +113,7 @@ The file sits next to `amd_fidelityfx_dx12.dll`. Everything in it can also be ch
 | `[Overlay] Enabled`, `ToggleKey` | `true`/`false`, key name | Overlay availability and key (`Home`, `F10`, `Insert`, `0x24`, ...). |
 | `[Overlay] ShowFps`, `FpsCorner` | `true`/`false`, `0`-`3` | FPS counter and its corner (0 TL, 1 TR, 2 BL, 3 BR). |
 | `[Overlay] Scale`, `BrightnessNits` | `0.5`-`3.0`, `50`-`1000` | UI scale; paper white on HDR displays. |
+| `[Overlay] UiLayer`, `UiRecomposition` | `true`, `false` | Tag the overlay as DLSS-G's UI layer (with a hud-less copy of the frame) so generated frames composite it instead of warping it. |
 | `[HUD] HudlessTags` | `false` | Experimental. Leave off for this game. |
 | `[Logging] Debug` | `false` | Write `ffx_bridge.log`. Leave off unless troubleshooting. |
 | `[Compat] LegacyTagging` | `false` | Troubleshooting: use the pre-2.14 Streamline tagging path. |
@@ -141,6 +145,11 @@ and read `WIN64\ffx_bridge.log` and `WIN64\streamline\sl.log`.
   hook failed, the overlay still appears once the game's Frame Generation is on. Games that load the
   D3D12 Agility SDK through a device factory may not be caught by the native hook either; frame
   generation on still gives you the overlay.
+- **The overlay smears or warps with frame generation on.** `UiLayer` should be `true` (default); the
+  Status panel's "UI layer" row says whether the hud-less and UI tags are being set.
+- **The FG model preset does not change.** NGX reads the preset when it creates the frame-generation
+  feature. The mod restarts frame generation for a few frames after a change; if `streamline\sl.log`
+  (with `Debug = true`) still reports the old "render preset", restart the game.
 - **Status says "no FidelityFX calls yet".** The game is not using FSR: pick FSR as the upscaler in the
   graphics menu. "FSR context exists but no upscale pass" means FSR is selected but idle (menu/loading).
 

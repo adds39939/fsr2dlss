@@ -133,6 +133,9 @@ static bool     g_dlssgDynamicOk = false;     // bIsDynamicMFGSupported
 static uint32_t g_dlssgStatus = 0;
 static uint64_t g_dlssgVram = 0;
 static uint32_t g_lastPresented = 0;          // numFramesActuallyPresented from the last state query
+static bool     g_layersTagged  = false;      // hud-less + UI layer tags are set for DLSS-G (cleared with null tags when they stop)
+static int      g_fgPresetApplied = -1;       // Config::fgPreset the running DLSS-G feature was created with
+static unsigned g_fgRestartFrames = 0;        // present frames to hold DLSS-G off so it re-creates its feature
 // Dev toggles (no rebuild), all resolved next to the mod DLL: fg_interp.flag (show only generated
 // frames), fg_fpscap.txt (target FPS -> Reflex frame cap).
 static uint32_t g_frameLimitUs = 0;           // Reflex frame cap in microseconds (0 = uncapped)
@@ -393,6 +396,13 @@ static sl::DLSSGMode wantedFgMode(uint32_t& numGen)
     if (g_dlssgMaxGen >= 1 && want > g_dlssgMaxGen) want = g_dlssgMaxGen;
     numGen = want;
     if (!g_fgEnabled || g_cfg.fgMode == FG_OFF) return sl::DLSSGMode::eOff;
+    // A model-preset change is picked up when NGX creates the DLSS-G feature: hold it off for a few
+    // presents so Streamline releases and re-creates it (no eRetainResourcesWhenOff).
+    if (g_fgPresetApplied != g_cfg.fgPreset) {
+        if (g_fgPresetApplied >= 0) { g_fgRestartFrames = 4; L("[FGC] DLSS-G preset %s -> %s: restarting frame generation", config_fg_preset_name(g_fgPresetApplied), config_fg_preset_name(g_cfg.fgPreset)); }
+        g_fgPresetApplied = g_cfg.fgPreset;
+    }
+    if (g_fgRestartFrames) return sl::DLSSGMode::eOff;
     if (g_cfg.fgMode == FG_DYNAMIC && g_dlssgDynamicOk) return sl::DLSSGMode::eDynamic;
     return sl::DLSSGMode::eOn;
 }
@@ -405,7 +415,7 @@ static sl::Result setDlssgOptions(sl::DLSSGMode mode, uint32_t numGen, bool inte
     o.numFramesToGenerate = numGen;
     o.flags = interpOnly ? sl::DLSSGFlags::eShowOnlyInterpolatedFrame : sl::DLSSGFlags{};
     o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;   // without it the generated frame is dropped
-    o.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
+    o.enableUserInterfaceRecomposition = (g_layersTagged && g_cfg.uiRecompose) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     o.dynamicTargetFrameRate = (mode == sl::DLSSGMode::eDynamic) ? g_cfg.fgDynamicFps : 0.0f;
     sl::ViewportHandle vp{0};
     return p_slDLSSGSetOptions(vp, o);
@@ -460,7 +470,7 @@ static void presentPre()
         sl::DLSSGMode mode = wantedFgMode(numGen);
         sl::Result orr = setDlssgOptions(mode, numGen, g_diagShowInterpOnly);
         if ((int)mode != g_lastAppliedMode || numGen != g_lastAppliedGen || g_diagShowInterpOnly != g_lastAppliedInterp) {
-            L("[FGC] slDLSSGSetOptions(mode=%s numFramesToGenerate=%u interpOnly=%d) -> %d (%s)", sl::getDLSSGModeAsStr(mode), numGen, (int)g_diagShowInterpOnly, (int)orr, resStr(orr));
+            L("[FGC] slDLSSGSetOptions(mode=%s numFramesToGenerate=%u interpOnly=%d uiRecomposition=%d) -> %d (%s)", sl::getDLSSGModeAsStr(mode), numGen, (int)g_diagShowInterpOnly, (int)(g_layersTagged && g_cfg.uiRecompose), (int)orr, resStr(orr));
             g_lastAppliedMode = (int)mode; g_lastAppliedGen = numGen; g_lastAppliedInterp = g_diagShowInterpOnly;
         }
         g_stats.fgApplied = (mode == sl::DLSSGMode::eOff) ? 0 : (mode == sl::DLSSGMode::eDynamic ? 1 : numGen + 1);
@@ -486,16 +496,51 @@ static void presentPre()
 static void presentPost()
 {
     ++g_presentCount;
+    if (g_fgRestartFrames) --g_fgRestartFrames;
     queryDlssgState();
     updateFpsStats();
     if (!g_curToken) return;
     mark(sl::PCLMarker::ePresentEnd, g_curToken);   // the token advances in feedDLSSG, keyed by the game's frameID
     if (g_presentCount >= WARMUP_PRESENTS && p_slReflexSleep) p_slReflexSleep(*g_curToken);
 }
+// Overlay first (it is render-submit work, before the markers), then hand DLSS-G the hud-less copy
+// and the UI layer the overlay produced so generated frames get the overlay composited, not warped.
+static void overlayAndLayers(IDXGISwapChain* sc)
+{
+    overlay_render(sc, g_queue, true);
+    OverlayLayers ly{};
+    bool have = overlay_fg_layers(&ly) && g_curToken;
+    if (have) {
+        sl::Resource hud(sl::ResourceType::eTex2d, ly.hudless, ly.hudlessState); hud.width = ly.width; hud.height = ly.height; hud.mipLevels = 1; hud.arrayLayers = 1;
+        sl::Resource ui (sl::ResourceType::eTex2d, ly.ui,      ly.uiState);      ui.width  = ly.width; ui.height  = ly.height; ui.mipLevels  = 1; ui.arrayLayers  = 1;
+        sl::Extent ext{0, 0, ly.width, ly.height};
+        sl::ResourceTag tags[2] = {
+            sl::ResourceTag(&hud, sl::kBufferTypeHUDLessColor,    sl::ResourceLifecycle::eValidUntilPresent, &ext),
+            sl::ResourceTag(&ui,  sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &ext),
+        };
+        sl::ViewportHandle vp{0};
+        sl::Result tr = setTags(g_curToken, vp, tags, 2, nullptr);
+        static int logged = 0;
+        if (!g_layersTagged || (tr != sl::Result::eOk && logged < 5)) { ++logged; L("[UI] hud-less + UI layer tags (%ux%u) -> %d (%s)", ly.width, ly.height, (int)tr, resStr(tr)); }
+        g_layersTagged = (tr == sl::Result::eOk);
+    } else if (g_layersTagged) {
+        // Layers stopped (overlay disabled them or FG is off): clear the tags so DLSS-G does not keep
+        // reading stale resources.
+        sl::ResourceTag tags[2] = {
+            sl::ResourceTag(nullptr, sl::kBufferTypeHUDLessColor,    sl::ResourceLifecycle::eValidUntilPresent, nullptr),
+            sl::ResourceTag(nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, nullptr),
+        };
+        sl::ViewportHandle vp{0};
+        if (g_curToken) setTags(g_curToken, vp, tags, 2, nullptr);
+        g_layersTagged = false;
+        L("[UI] hud-less + UI layer tags cleared");
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT f)
 {
     if (f & DXGI_PRESENT_TEST) return g_origPresent(This, s, f);   // occlusion probe, not a frame
-    overlay_render(This, g_queue, true);      // overlay is render-submit work: before the markers
+    overlayAndLayers(This);
     presentPre();
     HRESULT hr = g_origPresent(This, s, f);
     presentPost();
@@ -504,7 +549,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT s, UINT
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* This, UINT s, UINT f, const DXGI_PRESENT_PARAMETERS* p)
 {
     if (f & DXGI_PRESENT_TEST) return g_origPresent1(This, s, f, p);
-    overlay_render(This, g_queue, true);
+    overlayAndLayers(This);
     presentPre();
     HRESULT hr = g_origPresent1(This, s, f, p);
     presentPost();
@@ -1076,7 +1121,7 @@ extern "C" void slbridge_destroy(void* handle)
     if (c->dummyTex)   c->dummyTex->Release();
     if (c->uiTex)      c->uiTex->Release();
     if (c->sc4)        c->sc4->Release();
-    if (live) { g_scCtx = nullptr; g_csSet = false; g_status.slSwapchainLive = false; InterlockedExchange(&g_scTearingDown, 0); }
+    if (live) { g_scCtx = nullptr; g_csSet = false; g_layersTagged = false; g_status.slSwapchainLive = false; InterlockedExchange(&g_scTearingDown, 0); }
     c->magic = 0;
     delete c;
 }

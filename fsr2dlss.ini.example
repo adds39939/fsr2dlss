@@ -19,6 +19,12 @@ Multiplier = 3
 ; Target framerate for Mode = dynamic. 0 = auto (display refresh rate).
 DynamicTargetFps = 0
 
+; DLSS Frame Generation model preset: default, or a letter (A, B, C). This is the same setting the
+; NVIDIA App exposes as the frame-generation model preset; the mod answers the driver-profile query
+; NGX makes for it. Applied when frame generation (re)starts; restart the game if the DLSS-G
+; indicator still shows the old preset.
+FgPreset = default
+
 ; Flip metering (takes effect at the next game start):
 ;   hardware = the Blackwell display engine paces the generated frames (true 3x/4x MFG). Recommended.
 ;   software = block NvAPI_D3D12_SetFlipConfig so DLSS-G uses its software pacer (clean 2x only).
@@ -59,6 +65,10 @@ FpsCorner = 1
 ; Overlay UI scale (0.5 .. 3.0) and paper-white brightness in nits on HDR displays (50 .. 1000).
 Scale = 1.00
 BrightnessNits = 200
+; Hand the overlay to DLSS-G as a separate UI layer (hud-less colour + UI colour/alpha tags) so
+; frame generation does not warp it, and let DLSS-G recomposite the UI on generated frames.
+UiLayer = true
+UiRecomposition = true
 
 [HUD]
 ; Experimental. Tag a HUD-less color and UI layer for DLSS-G. Lies of P bakes the UI into the

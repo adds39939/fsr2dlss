@@ -16,11 +16,17 @@
 //    space. The patched DX12 backend applies the matching output transform.
 //  - GPU: one command list, 3 rotating allocators fenced on the queue. Back-buffer
 //    references are released every frame so ResizeBuffers is never blocked by us.
+//  - Layers: the UI is drawn into its own RGBA texture (premultiplied) and then
+//    composited onto the back buffer with a fullscreen blend. On the DLSS-G path a
+//    copy of the back buffer taken before that composite (hud-less) and the UI
+//    texture are handed to the bridge, which tags them so DLSS-G recomposites the
+//    overlay on generated frames instead of interpolating (warping) it.
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <d3dcompiler.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -73,8 +79,20 @@ static ID3D12DescriptorHeap*      g_rtvHeap    = nullptr;
 static ID3D12DescriptorHeap*      g_srvHeap    = nullptr;
 static UINT                       g_srvInc     = 0;
 static bool                       g_srvUsed[kSrvHeapSize] = {};
-static DXGI_FORMAT                g_rtvFormat  = DXGI_FORMAT_UNKNOWN;
+static DXGI_FORMAT                g_rtvFormat  = DXGI_FORMAT_UNKNOWN;   // ImGui renders into the UI layer: its format
 static UINT                       g_bbW = 0, g_bbH = 0;
+// UI layer + hud-less copy + composite pass
+static ID3D12Resource*            g_uiTex      = nullptr;
+static D3D12_RESOURCE_STATES      g_uiState    = D3D12_RESOURCE_STATE_COMMON;
+static DXGI_FORMAT                g_uiFmt      = DXGI_FORMAT_UNKNOWN;
+static ID3D12Resource*            g_hudTex     = nullptr;   // COPY_DEST between frames
+static DXGI_FORMAT                g_hudFmt     = DXGI_FORMAT_UNKNOWN;
+static UINT                       g_layerW = 0, g_layerH = 0;
+static D3D12_CPU_DESCRIPTOR_HANDLE g_uiSrvCpu{}; static D3D12_GPU_DESCRIPTOR_HANDLE g_uiSrvGpu{}; static bool g_uiSrvValid = false;
+static ID3D12RootSignature*       g_compRs     = nullptr;
+static ID3D12PipelineState*       g_compPso    = nullptr;
+static DXGI_FORMAT                g_compFmt    = DXGI_FORMAT_UNKNOWN;
+static bool                       g_layersValid = false;    // layers produced by the last overlay_render
 static bool                       g_gpuReady   = false;
 static bool                       g_imguiReady = false;
 static bool                       g_dx12Ready  = false;
@@ -195,7 +213,7 @@ static bool createGpuObjects()
     g_cmd->Close();
     if (FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) return false;
     g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    D3D12_DESCRIPTOR_HEAP_DESC rd{}; rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 1;
+    D3D12_DESCRIPTOR_HEAP_DESC rd{}; rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 2;   // [0] back buffer, [1] UI layer
     if (FAILED(g_dev->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&g_rtvHeap)))) return false;
     D3D12_DESCRIPTOR_HEAP_DESC sd{}; sd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; sd.NumDescriptors = kSrvHeapSize; sd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_dev->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&g_srvHeap)))) return false;
@@ -213,8 +231,18 @@ static void shutdownDx12Backend()
     g_dx12Ready = false;
 }
 
+static void releaseLayers()
+{
+    waitGpuIdle();
+    if (g_uiSrvValid) { srvFree(nullptr, g_uiSrvCpu, g_uiSrvGpu); g_uiSrvValid = false; }
+    rel(g_uiTex); rel(g_hudTex); g_uiFmt = g_hudFmt = DXGI_FORMAT_UNKNOWN; g_layerW = g_layerH = 0; g_layersValid = false;
+}
+static void releaseComposite() { waitGpuIdle(); rel(g_compPso); rel(g_compRs); g_compFmt = DXGI_FORMAT_UNKNOWN; }
+
 static void releaseGpuObjects()
 {
+    releaseLayers();
+    releaseComposite();
     shutdownDx12Backend();
     waitGpuIdle();
     for (UINT i = 0; i < kFramesInFlight; ++i) { rel(g_frames[i].alloc); g_frames[i].fenceValue = 0; }
@@ -222,6 +250,83 @@ static void releaseGpuObjects()
     if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
     g_gpuReady = false; g_frameIdx = 0;
 }
+
+// Fullscreen alpha-blend of the (premultiplied) UI layer onto the back buffer.
+static bool createComposite(DXGI_FORMAT rtFmt)
+{
+    if (g_compPso && g_compFmt == rtFmt) return true;
+    releaseComposite();
+    D3D12_DESCRIPTOR_RANGE range{}; range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER param{}; param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1; param.DescriptorTable.pDescriptorRanges = &range; param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samp{}; samp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP; samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs{}; rs.NumParameters = 1; rs.pParameters = &param; rs.NumStaticSamplers = 1; rs.pStaticSamplers = &samp;
+    rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+    ID3DBlob* sig = nullptr; ID3DBlob* err = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) || !sig) { OL("[OVL] composite root signature failed: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); return false; }
+    HRESULT hr = g_dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_compRs));
+    sig->Release();
+    if (FAILED(hr)) { OL("[OVL] CreateRootSignature failed 0x%08lx", (unsigned long)hr); return false; }
+
+    static const char* src =
+        "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+        "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+        "V vs(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2); o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        "float4 ps(V i) : SV_Target { return t.Sample(s, i.uv); }\n";
+    ID3DBlob* vs = nullptr; ID3DBlob* ps = nullptr;
+    if (FAILED(D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err))) { OL("[OVL] composite VS: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); return false; }
+    if (FAILED(D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err))) { OL("[OVL] composite PS: %s", err ? (const char*)err->GetBufferPointer() : "?"); if (err) err->Release(); vs->Release(); return false; }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = g_compRs;
+    pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;              // UI layer is premultiplied
+    pso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    pso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1; pso.RTVFormats[0] = rtFmt; pso.SampleDesc.Count = 1; pso.NodeMask = 1;
+    hr = g_dev->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_compPso));
+    vs->Release(); ps->Release();
+    if (FAILED(hr)) { OL("[OVL] composite PSO failed 0x%08lx (fmt=%u)", (unsigned long)hr, (unsigned)rtFmt); return false; }
+    g_compFmt = rtFmt;
+    return true;
+}
+
+// UI layer (always) and hud-less copy (DLSS-G path) sized to the back buffer.
+static bool ensureLayerTextures(UINT w, UINT h, DXGI_FORMAT uiFmt, DXGI_FORMAT bbFmt, bool wantHudless)
+{
+    if (g_uiTex && (g_layerW != w || g_layerH != h || g_uiFmt != uiFmt)) releaseLayers();
+    if (g_hudTex && g_hudFmt != bbFmt) { waitGpuIdle(); rel(g_hudTex); g_hudFmt = DXGI_FORMAT_UNKNOWN; }
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (!g_uiTex) {
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = uiFmt; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = uiFmt;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_uiTex)))) { OL("[OVL] UI layer texture failed"); return false; }
+        g_uiState = D3D12_RESOURCE_STATE_RENDER_TARGET; g_uiFmt = uiFmt; g_layerW = w; g_layerH = h;
+        if (!g_uiSrvValid) { srvAlloc(nullptr, &g_uiSrvCpu, &g_uiSrvGpu); g_uiSrvValid = g_uiSrvCpu.ptr != 0; }
+        if (!g_uiSrvValid) { OL("[OVL] no SRV slot for the UI layer"); return false; }
+        g_dev->CreateShaderResourceView(g_uiTex, nullptr, g_uiSrvCpu);
+        OL("[OVL] UI layer %ux%u fmt=%u", w, h, (unsigned)uiFmt);
+    }
+    if (wantHudless && !g_hudTex) {
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = bbFmt; rd.SampleDesc.Count = 1;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hudTex)))) { OL("[OVL] hud-less copy texture failed"); return false; }
+        g_hudFmt = bbFmt;
+        OL("[OVL] hud-less layer %ux%u fmt=%u", w, h, (unsigned)bbFmt);
+    }
+    return true;
+}
+static DXGI_FORMAT uiFormatFor(int colorMode) { return colorMode == 2 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM; }
 
 static void applyStyle()
 {
@@ -487,6 +592,8 @@ static void drawStatus()
         (s.fgStatus & 1) ? " resolution-too-low" : "", (s.fgStatus & 2) ? " reflex-missing" : "",
         (s.fgStatus & 4) ? " hdr-format" : "", (s.fgStatus & 8) ? " constants-invalid" : "", (s.fgStatus & 16) ? " backbuffer-index" : "");
     if (g_cfg.steamFix) row("Steam overlay", kDim, "FSR detector removed %u time(s)", st.steamUnhooks);
+    if (g_cfg.fgPreset > 0) row("FG preset", kDim, "requesting %s via the driver profile (confirm in streamline\\sl.log: \"render preset\")", config_fg_preset_name(g_cfg.fgPreset));
+    if (s.fgApplied && g_cfg.uiLayer) row("UI layer", g_layersValid ? kOk : kWarn, g_layersValid ? "hud-less + UI tagged, overlay composited after frame generation" : "not produced this frame");
 }
 
 static void drawMenu()
@@ -547,8 +654,20 @@ static void drawMenu()
         float tfps = g_cfg.fgDynamicFps;
         if (ImGui::InputFloat("Dynamic target fps (0 = refresh rate)", &tfps, 1.0f, 10.0f, "%.0f")) { if (tfps < 0) tfps = 0; if (tfps > 999) tfps = 999; g_cfg.fgDynamicFps = tfps; changed(); }
         ImGui::EndDisabled();
+        static const char* fgPresetNames[4] = { "Default (NVIDIA's choice)", "A", "B", "C" };
+        int fgp = (g_cfg.fgPreset >= 0 && g_cfg.fgPreset <= 3) ? g_cfg.fgPreset : 0;
+        if (comboInt("Model preset", &fgp, fgPresetNames, 4,
+                     "DLSS Frame Generation model preset (the NVIDIA App's frame-gen preset). Applied by answering\nNGX's driver-profile query; frame generation restarts briefly to pick it up.")) {
+            g_cfg.fgPreset = fgp; changed();
+        }
+        if (g_cfg.fgPreset > 3) ImGui::TextDisabled("Preset %s set in fsr2dlss.ini.", config_fg_preset_name(g_cfg.fgPreset));
         static const char* flipNames[3] = { "Software pacer (clean 2x)", "Hardware flip metering (true 3x/4x)", "Auto" };
         if (comboInt("Flip metering (needs restart)", &g_cfg.flipMode, flipNames, 3)) changed();
+        if (ImGui::Checkbox("Keep this overlay out of frame generation (UI layer)", &g_cfg.uiLayer)) changed();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("Tags a hud-less copy of the frame and the overlay as DLSS-G's UI layer,\nso generated frames get the overlay composited instead of warped.");
+        ImGui::BeginDisabled(!g_cfg.uiLayer);
+        if (ImGui::Checkbox("DLSS-G UI recomposition", &g_cfg.uiRecompose)) changed();
+        ImGui::EndDisabled();
     }
 
     // Overlay
@@ -627,9 +746,18 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     bool visible = g_visible != 0;
     if (!visible && !g_cfg.showFps) return;
 
+    // Layers for DLSS-G only make sense when frame generation is actually running on this swapchain.
+    bool wantLayers = slPath && g_cfg.uiLayer && g_stats.fgApplied > 0;
+    g_layersValid = false;
+    if (!visible && !g_cfg.showFps && !wantLayers) return;
+
     g_bbW = d.Width; g_bbH = d.Height;
-    if (g_dx12Ready && d.Format != g_rtvFormat) { OL("[OVL] back-buffer format changed %u -> %u, recreating backend", (unsigned)g_rtvFormat, (unsigned)d.Format); shutdownDx12Backend(); if (!slPath) g_colorMode = deriveColorMode(sc, d.Format); }
-    if (!initImGui(d.Format)) { g_failed = true; return; }
+    if (!slPath && d.Format != g_compFmt) g_colorMode = deriveColorMode(sc, d.Format);
+    DXGI_FORMAT uiFmt = uiFormatFor(g_colorMode);
+    if (g_dx12Ready && uiFmt != g_rtvFormat) { OL("[OVL] UI layer format changed %u -> %u, recreating backend", (unsigned)g_rtvFormat, (unsigned)uiFmt); shutdownDx12Backend(); }
+    if (!initImGui(uiFmt)) { g_failed = true; return; }
+    if (!ensureLayerTextures(g_bbW, g_bbH, uiFmt, d.Format, wantLayers)) { g_failed = true; return; }
+    if (!createComposite(d.Format)) { g_failed = true; return; }
     if (g_appliedScale != g_cfg.overlayScale) applyStyle();
 
     // Wait for the allocator we are about to reuse.
@@ -647,15 +775,34 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
 
     if (FAILED(fr.alloc->Reset()) || FAILED(g_cmd->Reset(fr.alloc, nullptr))) { bb->Release(); return; }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    g_dev->CreateRenderTargetView(bb, nullptr, rtv);
+    UINT rtvInc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvBb = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvUi = { rtvBb.ptr + rtvInc };
+    g_dev->CreateRenderTargetView(bb, nullptr, rtvBb);
+    g_dev->CreateRenderTargetView(g_uiTex, nullptr, rtvUi);
 
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = bb; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g_cmd->ResourceBarrier(1, &b);
-    g_cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        if (from == to) return;
+        D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from; b.Transition.StateAfter = to;
+        g_cmd->ResourceBarrier(1, &b);
+    };
+
+    // 1. Hud-less copy of the finished game frame (before the overlay goes in). Stays COPY_DEST.
+    if (wantLayers && g_hudTex) {
+        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g_cmd->CopyResource(g_hudTex, bb);
+        barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    } else {
+        barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    // 2. Draw the UI into its own (cleared, premultiplied) layer.
+    barrier(g_uiTex, g_uiState, D3D12_RESOURCE_STATE_RENDER_TARGET); g_uiState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    const float clear[4] = { 0, 0, 0, 0 };
+    g_cmd->ClearRenderTargetView(rtvUi, clear, 0, nullptr);
+    g_cmd->OMSetRenderTargets(1, &rtvUi, FALSE, nullptr);
     ID3D12DescriptorHeap* heaps[] = { g_srvHeap };
     g_cmd->SetDescriptorHeaps(1, heaps);
 
@@ -677,8 +824,18 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_cmd);
     LeaveCriticalSection(&g_cs);
 
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g_cmd->ResourceBarrier(1, &b);
+    // 3. Composite the UI layer onto the back buffer.
+    barrier(g_uiTex, g_uiState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); g_uiState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g_cmd->OMSetRenderTargets(1, &rtvBb, FALSE, nullptr);
+    D3D12_VIEWPORT vp{ 0, 0, (float)g_bbW, (float)g_bbH, 0, 1 }; D3D12_RECT scissor{ 0, 0, (LONG)g_bbW, (LONG)g_bbH };
+    g_cmd->RSSetViewports(1, &vp); g_cmd->RSSetScissorRects(1, &scissor);
+    g_cmd->SetGraphicsRootSignature(g_compRs);
+    g_cmd->SetPipelineState(g_compPso);
+    g_cmd->SetGraphicsRootDescriptorTable(0, g_uiSrvGpu);
+    g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_cmd->DrawInstanced(3, 1, 0, 0);
+    barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    g_layersValid = wantLayers && g_hudTex != nullptr;
     if (SUCCEEDED(g_cmd->Close())) {
         ID3D12CommandList* lists[] = { g_cmd };
         g_queue->ExecuteCommandLists(1, lists);
@@ -687,4 +844,13 @@ void overlay_render(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool slPath)
     }
     bb->Release();   // the swapchain keeps the buffer alive; never hold a reference across frames
     g_frameIdx = (g_frameIdx + 1) % kFramesInFlight;
+}
+
+bool overlay_fg_layers(OverlayLayers* out)
+{
+    if (!out || !g_layersValid || !g_uiTex || !g_hudTex) return false;
+    out->hudless = g_hudTex; out->hudlessState = (unsigned)D3D12_RESOURCE_STATE_COPY_DEST;
+    out->ui = g_uiTex;       out->uiState = (unsigned)g_uiState;
+    out->width = g_layerW;   out->height = g_layerH;
+    return true;
 }

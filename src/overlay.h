@@ -28,5 +28,13 @@ void overlay_before_resize();
 // A swapchain the overlay may be bound to is going away; it rebinds on the next overlay_render().
 void overlay_swapchain_destroyed(void* swapchain);
 
+// After overlay_render() on the DLSS-G path: the hud-less copy of the back buffer (taken before the
+// overlay was composited) and the overlay's own UI colour+alpha layer for this frame, with their
+// D3D12 resource states. Returns false when no layers were produced this frame (UI layer disabled,
+// frame generation off, native path). The bridge tags these for DLSS-G so it composites the overlay
+// after interpolation instead of warping it.
+struct OverlayLayers { void* hudless; unsigned hudlessState; void* ui; unsigned uiState; unsigned width, height; };
+bool overlay_fg_layers(OverlayLayers* out);
+
 // Release everything.
 void overlay_shutdown();

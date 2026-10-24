@@ -31,6 +31,7 @@ struct Config {
     int   fgMode        = FG_FIXED;
     int   fgMultiplier  = 3;        // 2..4, clamped to the card's numFramesToGenerateMax+1 at runtime
     float fgDynamicFps  = 0.0f;     // Dynamic MFG target fps; 0 = auto (display refresh rate)
+    int   fgPreset      = 0;        // DLSS-G model preset: 0 = default, 1 = A, 2 = B, 3 = C ... (DRS NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION)
     int   flipMode      = 1;        // 0 = software pacer (hide SetFlipConfig), 1 = hardware flip metering, 2 = auto
     // [Upscaling]
     bool  dlssSR        = true;     // false = pass the upscale through to the game's FSR
@@ -44,6 +45,8 @@ struct Config {
     int   fpsCorner     = 1;        // 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
     float overlayScale  = 1.0f;     // UI scale
     float overlayNits   = 200.0f;   // overlay paper-white on HDR displays
+    bool  uiLayer       = true;     // hand the overlay to DLSS-G as a UI layer (hud-less + UI tags) so it is not warped
+    bool  uiRecompose   = true;     // DLSSGOptions::enableUserInterfaceRecomposition when the UI layer is tagged
     // [HUD]
     bool  hudlessTags   = false;    // experimental HUDLessColor / UI tagging for DLSS-G
     // [Logging]
@@ -72,3 +75,5 @@ int         config_key_from_name(const char* s); // inverse; 0 if unknown
 const char* config_sr_quality_name(int q);
 const char* config_sr_preset_name(int p);
 const char* config_fg_mode_name(int m);
+const char* config_fg_preset_name(int p);       // "default", "A", "B", ...
+int         config_fg_preset_from_name(const char* s);
